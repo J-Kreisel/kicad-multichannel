@@ -36,26 +36,6 @@ def _find_channel(channels: list[Channel], name: str) -> Channel | None:
     return None
 
 
-def _calculate_rotation(src_rot: float, dst_rot: float) -> float:
-    """Calculate rotation difference, normalized to [-180, 180]."""
-    rotation = dst_rot - src_rot
-    while rotation > 180:
-        rotation -= 360
-    while rotation < -180:
-        rotation += 360
-    return rotation
-
-
-def _compute_translation(src_center_x: int, src_center_y: int, dst_center_x: int, dst_center_y: int, rotation: float) -> tuple[int, int]:
-    """Compute translation (dx, dy) from source center to target center.
-    
-    Translation is applied after per-point rotation in _apply_transform, so
-    no rotation is needed here — it's just the center-to-center delta."""
-    dx = int(round(dst_center_x - src_center_x))
-    dy = int(round(dst_center_y - src_center_y))
-    return dx, dy
-
-
 def _apply_transform(x: int, y: int, rot: float, center_x: int, center_y: int, dx: int, dy: int, rotation: float) -> tuple[float, float, float]:
     """Apply a transform to a point/orientation around a center.
     
@@ -115,16 +95,6 @@ def _round_to_nearest_90(rotation: float) -> int:
         rounded -= 360
     return int(rounded)
 
-    # Find best bucket by count
-    best_bucket = max(buckets.values(), key=len)
-    
-    # Average the values in the best bucket
-    avg_dx = sum(o[0] for o in best_bucket) / len(best_bucket)
-    avg_dy = sum(o[1] for o in best_bucket) / len(best_bucket)
-    avg_rot = sum(o[2] for o in best_bucket) / len(best_bucket)
-    
-    return int(round(avg_dx)), int(round(avg_dy)), avg_rot
-
 
 def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run: bool, verbose: bool, board) -> int:
     pairs = match_channels(main, target)
@@ -139,8 +109,8 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
     center_x = sum(fp.x for fp in matched_src_fps) // len(matched_src_fps)
     center_y = sum(fp.y for fp in matched_src_fps) // len(matched_src_fps)
 
-    # Calculate rotations for each pair
-    rotations: list[float] = []
+    # Calculate transforms for each pair
+    transforms: list[tuple[int, int, float]] = []
     for p in pairs:
         if not p.is_matched:
             continue
@@ -148,11 +118,12 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
         dst = target.fp_by_ref.get(p.to_ref)
         if src is None or dst is None:
             continue
-        rotations.append(_calculate_rotation(src.orientation, dst.orientation))
+        t = _calculate_transform(src.x, src.y, src.orientation, dst.x, dst.y, dst.orientation, center_x, center_y)
+        transforms.append(t)
 
     print(f"\n{main.name} -> {target.name}")
     print(f"  center: ({center_x:,}, {center_y:,}) nm")
-    print(f"  matched: {len(rotations)}/{len(main.footprints)} source")
+    print(f"  matched: {len(transforms)}/{len(main.footprints)} source")
     
     unmatched_src = [p.from_ref for p in pairs if p.from_ref and not p.to_ref]
     unmatched_tgt = [p.to_ref for p in pairs if p.to_ref and not p.from_ref]
@@ -161,38 +132,30 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
     if unmatched_tgt:
         print(f"  unmatched target: {unmatched_tgt}")
 
-    if not rotations:
+    if not transforms:
         print("  no confident offset, skipped")
         return 0
 
-    # Bucket rotations to find consensus
-    rot_buckets: dict[int, list[float]] = defaultdict(list)
-    for rot in rotations:
-        rot_buckets[_round_to_nearest_90(rot)].append(rot)
+    # Bucket voting to find consensus
+    buckets: dict[tuple[int, int, int], list[tuple[int, int, float]]] = defaultdict(list)
+    for dx, dy, rot in transforms:
+        pos_key = (round(dx / bucket_size_nm), round(dy / bucket_size_nm))
+        rot_key = _round_to_nearest_90(rot)
+        key = (pos_key[0], pos_key[1], rot_key)
+        buckets[key].append((dx, dy, rot))
     
-    best_rot_key = max(rot_buckets, key=lambda k: len(rot_buckets[k]))
-    avg_rot = sum(rot_buckets[best_rot_key]) / len(rot_buckets[best_rot_key])
-
-    # Compute target center from matched pairs
-    dst_center_x = sum(dst.x for _, dst in [(p, target.fp_by_ref.get(p.to_ref)) for p in pairs if p.is_matched and p.to_ref in target.fp_by_ref]) // len(rotations)
-    dst_center_y = sum(dst.y for _, dst in [(p, target.fp_by_ref.get(p.to_ref)) for p in pairs if p.is_matched and p.to_ref in target.fp_by_ref]) // len(rotations)
-
-    # Translation from centers
-    avg_dx, avg_dy = _compute_translation(center_x, center_y, dst_center_x, dst_center_y, avg_rot)
+    best_bucket = max(buckets.values(), key=len)
+    avg_dx = int(round(sum(t[0] for t in best_bucket) / len(best_bucket)))
+    avg_dy = int(round(sum(t[1] for t in best_bucket) / len(best_bucket)))
+    avg_rot = sum(t[2] for t in best_bucket) / len(best_bucket)
 
     print(f"  chosen offset: ({avg_dx:,}, {avg_dy:,}) nm, rotation: {avg_rot:.1f}°")
 
     if verbose:
         print(f"  {'SOURCE':<12} {'TARGET':<12} {'INDIV_OFFSET':>18} {'ROT':>8} {'SCORE':>8}")
         print(f"  {'-'*64}")
-        for p in pairs:
-            if not p.is_matched:
-                continue
-            src = main.fp_by_ref.get(p.from_ref)
-            dst = target.fp_by_ref.get(p.to_ref)
-            if src is None or dst is None:
-                continue
-            t_dx, t_dy, t_rot = _calculate_transform(src.x, src.y, src.orientation, dst.x, dst.y, dst.orientation, center_x, center_y)
+        matched_pairs = [p for p in pairs if p.is_matched]
+        for p, (t_dx, t_dy, t_rot) in zip(matched_pairs, transforms):
             print(f"  {p.from_ref:<12} {p.to_ref:<12} ({t_dx:>10,}, {t_dy:>6,})  {t_rot:>7.1f}° {p.score:>7.3f}")
 
     if not dry_run:
