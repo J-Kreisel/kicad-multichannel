@@ -36,77 +36,70 @@ def _find_channel(channels: list[Channel], name: str) -> Channel | None:
     return None
 
 
-def _matched_offsets(pairs: list[Match], source: Channel, target: Channel) -> list[tuple[int, int, float]]:
-    """Compute translation and rotation offsets for each matched pair.
+def _calculate_transform(src_x: int, src_y: int, src_rot: float, dst_x: int, dst_y: int, dst_rot: float, center_x: int, center_y: int) -> tuple[int, int, float]:
+    """Calculate the transform (dx, dy, rotation) from source to destination around a center.
     
-    Returns list of (dx, dy, rotation_degrees) where rotation is the implied
-    rotation of the target channel relative to the source channel.
+    Returns (dx, dy, rotation_deg) where:
+    - rotation is the difference in orientation (dst_rot - src_rot)
+    - dx, dy is the translation needed after rotating around center
     """
-    out: list[tuple[int, int, float]] = []
-    for p in pairs:
-        if not p.is_matched:
-            continue
-        src = source.fp_by_ref.get(p.from_ref)
-        dst = target.fp_by_ref.get(p.to_ref)
-        if src is None or dst is None:
-            continue
-        
-        # Translation offset
-        dx = dst.x - src.x
-        dy = dst.y - src.y
-        
-        # Rotation offset: angle from source-center->src to target-center->dst
-        # Vector from source center to source footprint
-        v1_x = src.x - source.center[0]
-        v1_y = src.y - source.center[1]
-        angle1 = math.atan2(v1_y, v1_x)
-        
-        # Vector from target center to target footprint
-        v2_x = dst.x - target.center[0]
-        v2_y = dst.y - target.center[1]
-        angle2 = math.atan2(v2_y, v2_x)
-        
-        # Rotation is the difference in angles
-        rotation = math.degrees(angle2 - angle1)
-        # Normalize to [-180, 180]
-        while rotation > 180:
-            rotation -= 360
-        while rotation < -180:
-            rotation += 360
-            
-        out.append((dx, dy, rotation))
-    return out
+    # Rotation is simply the difference in orientation
+    rotation = dst_rot - src_rot
+    # Normalize to [-180, 180]
+    while rotation > 180:
+        rotation -= 360
+    while rotation < -180:
+        rotation += 360
+    
+    # Vector from center to source
+    v1_x = src_x - center_x
+    v1_y = src_y - center_y
+    
+    # Rotate the source vector by the computed rotation
+    rot_rad = math.radians(rotation)
+    rot_x = v1_x * math.cos(rot_rad) - v1_y * math.sin(rot_rad)
+    rot_y = v1_x * math.sin(rot_rad) + v1_y * math.cos(rot_rad)
+    
+    # Translation is where rotated source would need to move to reach destination
+    dx = dst_x - (center_x + rot_x)
+    dy = dst_y - (center_y + rot_y)
+    
+    return int(round(dx)), int(round(dy)), rotation
+
+
+def _apply_transform(x: int, y: int, rot: float, center_x: int, center_y: int, dx: int, dy: int, rotation: float) -> tuple[float, float, float]:
+    """Apply a transform to a point/orientation around a center.
+    
+    Returns (new_x_mm, new_y_mm, new_rot_deg).
+    """
+    # Vector from center to point
+    rel_x = x - center_x
+    rel_y = y - center_y
+    
+    # Rotate the vector
+    rot_rad = math.radians(rotation)
+    new_rel_x = rel_x * math.cos(rot_rad) - rel_y * math.sin(rot_rad)
+    new_rel_y = rel_x * math.sin(rot_rad) + rel_y * math.cos(rot_rad)
+    
+    # New position: center + rotated vector + translation
+    new_x = (center_x + new_rel_x + dx) / 1_000_000
+    new_y = (center_y + new_rel_y + dy) / 1_000_000
+    
+    # New orientation
+    new_rot = rot + rotation
+    
+    return new_x, new_y, new_rot
 
 
 def _round_to_nearest_90(rotation: float) -> int:
     """Round rotation to nearest cardinal angle: -180, -90, 0, 90, 180."""
-    # Normalize to [0, 360) first
     rot = rotation % 360
-    # Round to nearest 90
     rounded = round(rot / 90) * 90
-    # Handle 360 -> 0
     if rounded >= 360:
         rounded = 0
-    # Convert back to signed for consistency
     if rounded > 180:
         rounded -= 360
     return int(rounded)
-
-
-def _choose_offset(offsets: list[tuple[int, int, float]], bucket_size_nm: int) -> tuple[int, int, float] | None:
-    """Choose best offset via bucket voting, including rotation bucketing.
-    
-    Rotation is bucketed to nearest 90 degrees (0, 90, 180, 270/-90).
-    """
-    if not offsets:
-        return None
-
-    buckets: dict[tuple[int, int, int], list[tuple[int, int, float]]] = defaultdict(list)
-    for dx, dy, rot in offsets:
-        pos_key = (round(dx / bucket_size_nm), round(dy / bucket_size_nm))
-        rot_key = _round_to_nearest_90(rot)
-        key = (pos_key[0], pos_key[1], rot_key)
-        buckets[key].append((dx, dy, rot))
 
     # Find best bucket by count
     best_bucket = max(buckets.values(), key=len)
@@ -121,11 +114,33 @@ def _choose_offset(offsets: list[tuple[int, int, float]], bucket_size_nm: int) -
 
 def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run: bool, verbose: bool, board) -> int:
     pairs = match_channels(main, target)
-    offsets = _matched_offsets(pairs, main, target)
-    offset = _choose_offset(offsets, bucket_size_nm)
+    
+    # Calculate center from matched source footprints
+    matched_src_fps = [main.fp_by_ref[p.from_ref] for p in pairs if p.is_matched and p.from_ref in main.fp_by_ref]
+    if not matched_src_fps:
+        print(f"\n{main.name} -> {target.name}")
+        print("  no matched footprints")
+        return 0
+    
+    center_x = sum(fp.x for fp in matched_src_fps) // len(matched_src_fps)
+    center_y = sum(fp.y for fp in matched_src_fps) // len(matched_src_fps)
+
+    # Calculate transforms for each pair
+    transforms: list[tuple[int, int, float]] = []
+    for p in pairs:
+        if not p.is_matched:
+            continue
+        src = main.fp_by_ref.get(p.from_ref)
+        dst = target.fp_by_ref.get(p.to_ref)
+        if src is None or dst is None:
+            continue
+        dx, dy, rot = _calculate_transform(src.x, src.y, src.orientation, dst.x, dst.y, dst.orientation, center_x, center_y)
+        transforms.append((dx, dy, rot))
 
     print(f"\n{main.name} -> {target.name}")
-    print(f"  matched: {sum(1 for p in pairs if p.is_matched)}/{len(main.footprints)} source")
+    print(f"  center: ({center_x:,}, {center_y:,}) nm")
+    print(f"  matched: {len(transforms)}/{len(main.footprints)} source")
+    
     unmatched_src = [p.from_ref for p in pairs if p.from_ref and not p.to_ref]
     unmatched_tgt = [p.to_ref for p in pairs if p.to_ref and not p.from_ref]
     if unmatched_src:
@@ -133,33 +148,42 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
     if unmatched_tgt:
         print(f"  unmatched target: {unmatched_tgt}")
 
-    if offset is None:
+    if not transforms:
         print("  no confident offset, skipped")
         return 0
 
-    print(f"  chosen offset: ({offset[0]:,}, {offset[1]:,}) nm, rotation: {offset[2]:.1f}°")
+    # Bucket voting to find consensus
+    buckets: dict[tuple[int, int, int], list[tuple[int, int, float]]] = defaultdict(list)
+    for dx, dy, rot in transforms:
+        pos_key = (round(dx / bucket_size_nm), round(dy / bucket_size_nm))
+        rot_key = _round_to_nearest_90(rot)
+        key = (pos_key[0], pos_key[1], rot_key)
+        buckets[key].append((dx, dy, rot))
+    
+    best_bucket = max(buckets.values(), key=len)
+    avg_dx = int(round(sum(t[0] for t in best_bucket) / len(best_bucket)))
+    avg_dy = int(round(sum(t[1] for t in best_bucket) / len(best_bucket)))
+    avg_rot = sum(t[2] for t in best_bucket) / len(best_bucket)
+
+    print(f"  chosen offset: ({avg_dx:,}, {avg_dy:,}) nm, rotation: {avg_rot:.1f}°")
 
     if verbose:
-        print(f"  {'SOURCE':<12} {'TARGET':<12} {'INDIV_OFFSET':>18} {'ROT':>8} {'SCORE':>8}")
+        print(f"  {'SOURCE':<12} {'TARGET':<12} {'POS_OFFSET':>18} {'ROT':>8} {'SCORE':>8}")
         print(f"  {'-'*64}")
         for p in pairs:
             if not p.is_matched:
                 continue
-            src_fp = main.fp_by_ref.get(p.from_ref)
-            dst_fp = target.fp_by_ref.get(p.to_ref)
-            if src_fp is None or dst_fp is None:
+            src = main.fp_by_ref.get(p.from_ref)
+            dst = target.fp_by_ref.get(p.to_ref)
+            if src is None or dst is None:
                 continue
-            ind_dx = dst_fp.x - src_fp.x
-            ind_dy = dst_fp.y - src_fp.y
-            # Calculate individual rotation
-            v1_x = src_fp.x - main.center[0]
-            v1_y = src_fp.y - main.center[1]
-            angle1 = math.atan2(v1_y, v1_x)
-            v2_x = dst_fp.x - target.center[0]
-            v2_y = dst_fp.y - target.center[1]
-            angle2 = math.atan2(v2_y, v2_x)
-            rot = math.degrees(angle2 - angle1)
-            print(f"  {p.from_ref:<12} {p.to_ref:<12} ({ind_dx:>10,}, {ind_dy:>6,})  {rot:>7.1f}° {p.score:>7.3f}")
+            # Calculate individual transform
+            t_dx, t_dy, t_rot = _calculate_transform(src.x, src.y, src.orientation, dst.x, dst.y, dst.orientation, center_x, center_y)
+            # Calculate error from consensus
+            new_x, new_y, new_rot = _apply_transform(src.x, src.y, src.orientation, center_x, center_y, avg_dx, avg_dy, avg_rot)
+            err_x = int(new_x * 1_000_000) - dst.x
+            err_y = int(new_y * 1_000_000) - dst.y
+            print(f"  {p.from_ref:<12} {p.to_ref:<12} ({err_x:>10,}, {err_y:>6,})  {t_rot:>7.1f}° {p.score:>7.3f}")
 
     if not dry_run:
         all_fps = list(board.get_footprints())
@@ -167,35 +191,22 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
 
         commit = board.begin_commit()
         updated_wrappers: list[object] = []
-        dx, dy, rotation = offset
-        rotation_rad = math.radians(rotation)
-        cos_r = math.cos(rotation_rad)
-        sin_r = math.sin(rotation_rad)
         
         for p in pairs:
             if not p.is_matched:
                 continue
-            src_fp = main.fp_by_ref.get(p.from_ref)
-            if src_fp is None:
+            src = main.fp_by_ref.get(p.from_ref)
+            if src is None:
                 continue
             fp = fp_by_ref.get(p.to_ref)
             if fp is None:
                 continue
             
-            # Vector from source center to source footprint
-            rel_x = src_fp.x - main.center[0]
-            rel_y = src_fp.y - main.center[1]
-            
-            # Rotate the vector
-            rot_x = rel_x * cos_r - rel_y * sin_r
-            rot_y = rel_x * sin_r + rel_y * cos_r
-            
-            # New position: target center + rotated vector + translation offset
-            new_x = (target.center[0] + rot_x + dx) / 1_000_000
-            new_y = (target.center[1] + rot_y + dy) / 1_000_000
+            # Apply transform using consensus values
+            new_x, new_y, new_rot = _apply_transform(src.x, src.y, src.orientation, center_x, center_y, avg_dx, avg_dy, avg_rot)
             
             fp.position = geom.Vector2.from_xy_mm(new_x, new_y)
-            fp.orientation = geom.Angle.from_degrees(src_fp.orientation + rotation)
+            fp.orientation = geom.Angle.from_degrees(new_rot)
             updated_wrappers.append(fp)
 
         if updated_wrappers:
