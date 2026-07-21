@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -13,7 +14,7 @@ from kipy.proto.common.types import KiCadObjectType
 _log = logging.getLogger(__name__)
 
 _UUID_RE = re.compile(
-    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
 
 
@@ -51,6 +52,15 @@ class Channel:
     @property
     def fp_by_kid(self) -> dict[str, Footprint]:
         return {fp.kid: fp for fp in self.footprints}
+
+    @property
+    def center(self) -> tuple[int, int]:
+        """Geometric center of all footprints (average position)."""
+        if not self.footprints:
+            return (0, 0)
+        avg_x = sum(fp.x for fp in self.footprints) // len(self.footprints)
+        avg_y = sum(fp.y for fp in self.footprints) // len(self.footprints)
+        return (avg_x, avg_y)
 
 
 def _kid(obj) -> str:

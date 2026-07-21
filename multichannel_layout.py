@@ -36,8 +36,13 @@ def _find_channel(channels: list[Channel], name: str) -> Channel | None:
     return None
 
 
-def _matched_offsets(pairs: list[Match], source: Channel, target: Channel) -> list[tuple[int, int]]:
-    out: list[tuple[int, int]] = []
+def _matched_offsets(pairs: list[Match], source: Channel, target: Channel) -> list[tuple[int, int, float]]:
+    """Compute translation and rotation offsets for each matched pair.
+    
+    Returns list of (dx, dy, rotation_degrees) where rotation is the implied
+    rotation of the target channel relative to the source channel.
+    """
+    out: list[tuple[int, int, float]] = []
     for p in pairs:
         if not p.is_matched:
             continue
@@ -45,32 +50,73 @@ def _matched_offsets(pairs: list[Match], source: Channel, target: Channel) -> li
         dst = target.fp_by_ref.get(p.to_ref)
         if src is None or dst is None:
             continue
-        out.append((dst.x - src.x, dst.y - src.y))
+        
+        # Translation offset
+        dx = dst.x - src.x
+        dy = dst.y - src.y
+        
+        # Rotation offset: angle from source-center->src to target-center->dst
+        # Vector from source center to source footprint
+        v1_x = src.x - source.center[0]
+        v1_y = src.y - source.center[1]
+        angle1 = math.atan2(v1_y, v1_x)
+        
+        # Vector from target center to target footprint
+        v2_x = dst.x - target.center[0]
+        v2_y = dst.y - target.center[1]
+        angle2 = math.atan2(v2_y, v2_x)
+        
+        # Rotation is the difference in angles
+        rotation = math.degrees(angle2 - angle1)
+        # Normalize to [-180, 180]
+        while rotation > 180:
+            rotation -= 360
+        while rotation < -180:
+            rotation += 360
+            
+        out.append((dx, dy, rotation))
     return out
 
 
-def _choose_offset(offsets: list[tuple[int, int]], bucket_size_nm: int) -> tuple[int, int] | None:
+def _round_to_nearest_90(rotation: float) -> int:
+    """Round rotation to nearest cardinal angle: -180, -90, 0, 90, 180."""
+    # Normalize to [0, 360) first
+    rot = rotation % 360
+    # Round to nearest 90
+    rounded = round(rot / 90) * 90
+    # Handle 360 -> 0
+    if rounded >= 360:
+        rounded = 0
+    # Convert back to signed for consistency
+    if rounded > 180:
+        rounded -= 360
+    return int(rounded)
+
+
+def _choose_offset(offsets: list[tuple[int, int, float]], bucket_size_nm: int) -> tuple[int, int, float] | None:
+    """Choose best offset via bucket voting, including rotation bucketing.
+    
+    Rotation is bucketed to nearest 90 degrees (0, 90, 180, 270/-90).
+    """
     if not offsets:
         return None
 
-    buckets: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
-    for dx, dy in offsets:
-        key = (round(dx / bucket_size_nm), round(dy / bucket_size_nm))
-        buckets[key].append((dx, dy))
+    buckets: dict[tuple[int, int, int], list[tuple[int, int, float]]] = defaultdict(list)
+    for dx, dy, rot in offsets:
+        pos_key = (round(dx / bucket_size_nm), round(dy / bucket_size_nm))
+        rot_key = _round_to_nearest_90(rot)
+        key = (pos_key[0], pos_key[1], rot_key)
+        buckets[key].append((dx, dy, rot))
 
-    mean_dx = sum(o[0] for o in offsets) / len(offsets)
-    mean_dy = sum(o[1] for o in offsets) / len(offsets)
-
-    def bucket_avg(items: list[tuple[int, int]]) -> tuple[float, float]:
-        return sum(i[0] for i in items) / len(items), sum(i[1] for i in items) / len(items)
-
-    def dist_to_mean(items: list[tuple[int, int]]) -> float:
-        ax, ay = bucket_avg(items)
-        return math.hypot(ax - mean_dx, ay - mean_dy)
-
-    best_items = max(buckets.values(), key=lambda items: (len(items), -dist_to_mean(items)))
-    avg_dx, avg_dy = bucket_avg(best_items)
-    return int(round(avg_dx)), int(round(avg_dy))
+    # Find best bucket by count
+    best_bucket = max(buckets.values(), key=len)
+    
+    # Average the values in the best bucket
+    avg_dx = sum(o[0] for o in best_bucket) / len(best_bucket)
+    avg_dy = sum(o[1] for o in best_bucket) / len(best_bucket)
+    avg_rot = sum(o[2] for o in best_bucket) / len(best_bucket)
+    
+    return int(round(avg_dx)), int(round(avg_dy)), avg_rot
 
 
 def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run: bool, verbose: bool, board) -> int:
@@ -91,11 +137,11 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
         print("  no confident offset, skipped")
         return 0
 
-    print(f"  chosen offset: ({offset[0]:,}, {offset[1]:,}) nm")
+    print(f"  chosen offset: ({offset[0]:,}, {offset[1]:,}) nm, rotation: {offset[2]:.1f}°")
 
     if verbose:
-        print(f"  {'SOURCE':<12} {'TARGET':<12} {'INDIV_OFFSET':>18} {'SCORE':>8}")
-        print(f"  {'-'*56}")
+        print(f"  {'SOURCE':<12} {'TARGET':<12} {'INDIV_OFFSET':>18} {'ROT':>8} {'SCORE':>8}")
+        print(f"  {'-'*64}")
         for p in pairs:
             if not p.is_matched:
                 continue
@@ -105,7 +151,15 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
                 continue
             ind_dx = dst_fp.x - src_fp.x
             ind_dy = dst_fp.y - src_fp.y
-            print(f"  {p.from_ref:<12} {p.to_ref:<12} ({ind_dx:>10,}, {ind_dy:>6,})  {p.score:>7.3f}")
+            # Calculate individual rotation
+            v1_x = src_fp.x - main.center[0]
+            v1_y = src_fp.y - main.center[1]
+            angle1 = math.atan2(v1_y, v1_x)
+            v2_x = dst_fp.x - target.center[0]
+            v2_y = dst_fp.y - target.center[1]
+            angle2 = math.atan2(v2_y, v2_x)
+            rot = math.degrees(angle2 - angle1)
+            print(f"  {p.from_ref:<12} {p.to_ref:<12} ({ind_dx:>10,}, {ind_dy:>6,})  {rot:>7.1f}° {p.score:>7.3f}")
 
     if not dry_run:
         all_fps = list(board.get_footprints())
@@ -113,6 +167,11 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
 
         commit = board.begin_commit()
         updated_wrappers: list[object] = []
+        dx, dy, rotation = offset
+        rotation_rad = math.radians(rotation)
+        cos_r = math.cos(rotation_rad)
+        sin_r = math.sin(rotation_rad)
+        
         for p in pairs:
             if not p.is_matched:
                 continue
@@ -122,10 +181,21 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
             fp = fp_by_ref.get(p.to_ref)
             if fp is None:
                 continue
-            new_x = (src_fp.x + offset[0]) / 1_000_000
-            new_y = (src_fp.y + offset[1]) / 1_000_000
+            
+            # Vector from source center to source footprint
+            rel_x = src_fp.x - main.center[0]
+            rel_y = src_fp.y - main.center[1]
+            
+            # Rotate the vector
+            rot_x = rel_x * cos_r - rel_y * sin_r
+            rot_y = rel_x * sin_r + rel_y * cos_r
+            
+            # New position: target center + rotated vector + translation offset
+            new_x = (target.center[0] + rot_x + dx) / 1_000_000
+            new_y = (target.center[1] + rot_y + dy) / 1_000_000
+            
             fp.position = geom.Vector2.from_xy_mm(new_x, new_y)
-            fp.orientation = geom.Angle.from_degrees(src_fp.orientation)
+            fp.orientation = geom.Angle.from_degrees(src_fp.orientation + rotation)
             updated_wrappers.append(fp)
 
         if updated_wrappers:
