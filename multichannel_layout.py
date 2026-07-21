@@ -39,6 +39,9 @@ def _find_channel(channels: list[Channel], name: str) -> Channel | None:
 def _calculate_transform(src_x: int, src_y: int, src_rot: float, dst_x: int, dst_y: int, dst_rot: float, center_x: int, center_y: int) -> tuple[int, int, float]:
     """Calculate the transform (dx, dy, rotation) from source to destination around a center.
     
+    KiCad uses flipped Y coordinates (Y increases downward) with CCW rotation.
+    Adjusted rotation formulas account for this.
+    
     Returns (dx, dy, rotation_deg) where:
     - rotation is the difference in orientation (dst_rot - src_rot)
     - dx, dy is the translation needed after rotating around center
@@ -56,9 +59,10 @@ def _calculate_transform(src_x: int, src_y: int, src_rot: float, dst_x: int, dst
     v1_y = src_y - center_y
     
     # Rotate the source vector by the computed rotation
+    # KiCad has flipped Y, so we negate the sin terms
     rot_rad = math.radians(rotation)
-    rot_x = v1_x * math.cos(rot_rad) - v1_y * math.sin(rot_rad)
-    rot_y = v1_x * math.sin(rot_rad) + v1_y * math.cos(rot_rad)
+    rot_x = v1_x * math.cos(rot_rad) + v1_y * math.sin(rot_rad)
+    rot_y = -v1_x * math.sin(rot_rad) + v1_y * math.cos(rot_rad)
     
     # Translation is where rotated source would need to move to reach destination
     dx = dst_x - (center_x + rot_x)
@@ -70,6 +74,9 @@ def _calculate_transform(src_x: int, src_y: int, src_rot: float, dst_x: int, dst
 def _apply_transform(x: int, y: int, rot: float, center_x: int, center_y: int, dx: int, dy: int, rotation: float) -> tuple[float, float, float]:
     """Apply a transform to a point/orientation around a center.
     
+    KiCad uses flipped Y coordinates (Y increases downward) with CCW rotation.
+    Adjusted rotation formulas account for this.
+    
     Returns (new_x_mm, new_y_mm, new_rot_deg).
     """
     # Vector from center to point
@@ -77,9 +84,10 @@ def _apply_transform(x: int, y: int, rot: float, center_x: int, center_y: int, d
     rel_y = y - center_y
     
     # Rotate the vector
+    # KiCad has flipped Y, so we negate the sin terms
     rot_rad = math.radians(rotation)
-    new_rel_x = rel_x * math.cos(rot_rad) - rel_y * math.sin(rot_rad)
-    new_rel_y = rel_x * math.sin(rot_rad) + rel_y * math.cos(rot_rad)
+    new_rel_x = rel_x * math.cos(rot_rad) + rel_y * math.sin(rot_rad)
+    new_rel_y = -rel_x * math.sin(rot_rad) + rel_y * math.cos(rot_rad)
     
     # New position: center + rotated vector + translation
     new_x = (center_x + new_rel_x + dx) / 1_000_000
