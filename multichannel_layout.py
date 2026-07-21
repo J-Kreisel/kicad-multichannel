@@ -84,6 +84,27 @@ def _apply_transform(x: int, y: int, rot: float, center_x: int, center_y: int, d
     return new_x, new_y, new_rot
 
 
+def _calculate_transform(src_x: int, src_y: int, src_rot: float, dst_x: int, dst_y: int, dst_rot: float, center_x: int, center_y: int) -> tuple[int, int, float]:
+    """Calculate the transform (dx, dy, rotation) from source to destination around a center."""
+    rotation = dst_rot - src_rot
+    while rotation > 180:
+        rotation -= 360
+    while rotation < -180:
+        rotation += 360
+
+    v1_x = src_x - center_x
+    v1_y = src_y - center_y
+
+    rot_rad = math.radians(rotation)
+    rot_x = v1_x * math.cos(rot_rad) + v1_y * math.sin(rot_rad)
+    rot_y = - v1_x * math.sin(rot_rad) + v1_y * math.cos(rot_rad)
+
+    dx = dst_x - (center_x + rot_x)
+    dy = dst_y - (center_y + rot_y)
+
+    return int(round(dx)), int(round(dy)), rotation
+
+
 def _round_to_nearest_90(rotation: float) -> int:
     """Round rotation to nearest cardinal angle: -180, -90, 0, 90, 180."""
     rot = rotation % 360
@@ -171,8 +192,8 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
             dst = target.fp_by_ref.get(p.to_ref)
             if src is None or dst is None:
                 continue
-            rot = _calculate_rotation(src.orientation, dst.orientation)
-            print(f"  {p.from_ref:<12} {p.to_ref:<12} ({avg_dx:>10,}, {avg_dy:>6,})  {rot:>7.1f}° {p.score:>7.3f}")
+            t_dx, t_dy, t_rot = _calculate_transform(src.x, src.y, src.orientation, dst.x, dst.y, dst.orientation, center_x, center_y)
+            print(f"  {p.from_ref:<12} {p.to_ref:<12} ({t_dx:>10,}, {t_dy:>6,})  {t_rot:>7.1f}° {p.score:>7.3f}")
 
     if not dry_run:
         all_fps = list(board.get_footprints())
