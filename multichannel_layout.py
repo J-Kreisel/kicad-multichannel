@@ -36,39 +36,24 @@ def _find_channel(channels: list[Channel], name: str) -> Channel | None:
     return None
 
 
-def _calculate_transform(src_x: int, src_y: int, src_rot: float, dst_x: int, dst_y: int, dst_rot: float, center_x: int, center_y: int) -> tuple[int, int, float]:
-    """Calculate the transform (dx, dy, rotation) from source to destination around a center.
-    
-    KiCad uses flipped Y coordinates (Y increases downward) with CCW rotation.
-    Adjusted rotation formulas account for this.
-    
-    Returns (dx, dy, rotation_deg) where:
-    - rotation is the difference in orientation (dst_rot - src_rot)
-    - dx, dy is the translation needed after rotating around center
-    """
-    # Rotation is simply the difference in orientation
+def _calculate_rotation(src_rot: float, dst_rot: float) -> float:
+    """Calculate rotation difference, normalized to [-180, 180]."""
     rotation = dst_rot - src_rot
-    # Normalize to [-180, 180]
     while rotation > 180:
         rotation -= 360
     while rotation < -180:
         rotation += 360
+    return rotation
+
+
+def _compute_translation(src_center_x: int, src_center_y: int, dst_center_x: int, dst_center_y: int, rotation: float) -> tuple[int, int]:
+    """Compute translation (dx, dy) from source center to target center.
     
-    # Vector from center to source
-    v1_x = src_x - center_x
-    v1_y = src_y - center_y
-    
-    # Rotate the source vector by the computed rotation
-    # KiCad has flipped Y, so we negate the sin terms
-    rot_rad = math.radians(rotation)
-    rot_x = v1_x * math.cos(rot_rad) + v1_y * math.sin(rot_rad)
-    rot_y = -v1_x * math.sin(rot_rad) + v1_y * math.cos(rot_rad)
-    
-    # Translation is where rotated source would need to move to reach destination
-    dx = dst_x - (center_x + rot_x)
-    dy = dst_y - (center_y + rot_y)
-    
-    return int(round(dx)), int(round(dy)), rotation
+    Translation is applied after per-point rotation in _apply_transform, so
+    no rotation is needed here — it's just the center-to-center delta."""
+    dx = int(round(dst_center_x - src_center_x))
+    dy = int(round(dst_center_y - src_center_y))
+    return dx, dy
 
 
 def _apply_transform(x: int, y: int, rot: float, center_x: int, center_y: int, dx: int, dy: int, rotation: float) -> tuple[float, float, float]:
@@ -84,7 +69,7 @@ def _apply_transform(x: int, y: int, rot: float, center_x: int, center_y: int, d
     rel_y = y - center_y
     
     # Rotate the vector
-    # KiCad has flipped Y, so we negate the sin terms
+    # KiCad has flipped Y (increases downward), negate sin terms for CCW on screen
     rot_rad = math.radians(rotation)
     new_rel_x = rel_x * math.cos(rot_rad) + rel_y * math.sin(rot_rad)
     new_rel_y = -rel_x * math.sin(rot_rad) + rel_y * math.cos(rot_rad)
@@ -133,8 +118,8 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
     center_x = sum(fp.x for fp in matched_src_fps) // len(matched_src_fps)
     center_y = sum(fp.y for fp in matched_src_fps) // len(matched_src_fps)
 
-    # Calculate transforms for each pair
-    transforms: list[tuple[int, int, float]] = []
+    # Calculate rotations for each pair
+    rotations: list[float] = []
     for p in pairs:
         if not p.is_matched:
             continue
@@ -142,12 +127,11 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
         dst = target.fp_by_ref.get(p.to_ref)
         if src is None or dst is None:
             continue
-        dx, dy, rot = _calculate_transform(src.x, src.y, src.orientation, dst.x, dst.y, dst.orientation, center_x, center_y)
-        transforms.append((dx, dy, rot))
+        rotations.append(_calculate_rotation(src.orientation, dst.orientation))
 
     print(f"\n{main.name} -> {target.name}")
     print(f"  center: ({center_x:,}, {center_y:,}) nm")
-    print(f"  matched: {len(transforms)}/{len(main.footprints)} source")
+    print(f"  matched: {len(rotations)}/{len(main.footprints)} source")
     
     unmatched_src = [p.from_ref for p in pairs if p.from_ref and not p.to_ref]
     unmatched_tgt = [p.to_ref for p in pairs if p.to_ref and not p.from_ref]
@@ -156,27 +140,29 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
     if unmatched_tgt:
         print(f"  unmatched target: {unmatched_tgt}")
 
-    if not transforms:
+    if not rotations:
         print("  no confident offset, skipped")
         return 0
 
-    # Bucket voting to find consensus
-    buckets: dict[tuple[int, int, int], list[tuple[int, int, float]]] = defaultdict(list)
-    for dx, dy, rot in transforms:
-        pos_key = (round(dx / bucket_size_nm), round(dy / bucket_size_nm))
-        rot_key = _round_to_nearest_90(rot)
-        key = (pos_key[0], pos_key[1], rot_key)
-        buckets[key].append((dx, dy, rot))
+    # Bucket rotations to find consensus
+    rot_buckets: dict[int, list[float]] = defaultdict(list)
+    for rot in rotations:
+        rot_buckets[_round_to_nearest_90(rot)].append(rot)
     
-    best_bucket = max(buckets.values(), key=len)
-    avg_dx = int(round(sum(t[0] for t in best_bucket) / len(best_bucket)))
-    avg_dy = int(round(sum(t[1] for t in best_bucket) / len(best_bucket)))
-    avg_rot = sum(t[2] for t in best_bucket) / len(best_bucket)
+    best_rot_key = max(rot_buckets, key=lambda k: len(rot_buckets[k]))
+    avg_rot = sum(rot_buckets[best_rot_key]) / len(rot_buckets[best_rot_key])
+
+    # Compute target center from matched pairs
+    dst_center_x = sum(dst.x for _, dst in [(p, target.fp_by_ref.get(p.to_ref)) for p in pairs if p.is_matched and p.to_ref in target.fp_by_ref]) // len(rotations)
+    dst_center_y = sum(dst.y for _, dst in [(p, target.fp_by_ref.get(p.to_ref)) for p in pairs if p.is_matched and p.to_ref in target.fp_by_ref]) // len(rotations)
+
+    # Translation from centers
+    avg_dx, avg_dy = _compute_translation(center_x, center_y, dst_center_x, dst_center_y, avg_rot)
 
     print(f"  chosen offset: ({avg_dx:,}, {avg_dy:,}) nm, rotation: {avg_rot:.1f}°")
 
     if verbose:
-        print(f"  {'SOURCE':<12} {'TARGET':<12} {'POS_OFFSET':>18} {'ROT':>8} {'SCORE':>8}")
+        print(f"  {'SOURCE':<12} {'TARGET':<12} {'INDIV_OFFSET':>18} {'ROT':>8} {'SCORE':>8}")
         print(f"  {'-'*64}")
         for p in pairs:
             if not p.is_matched:
@@ -185,13 +171,8 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
             dst = target.fp_by_ref.get(p.to_ref)
             if src is None or dst is None:
                 continue
-            # Calculate individual transform
-            t_dx, t_dy, t_rot = _calculate_transform(src.x, src.y, src.orientation, dst.x, dst.y, dst.orientation, center_x, center_y)
-            # Calculate error from consensus
-            new_x, new_y, new_rot = _apply_transform(src.x, src.y, src.orientation, center_x, center_y, avg_dx, avg_dy, avg_rot)
-            err_x = int(new_x * 1_000_000) - dst.x
-            err_y = int(new_y * 1_000_000) - dst.y
-            print(f"  {p.from_ref:<12} {p.to_ref:<12} ({err_x:>10,}, {err_y:>6,})  {t_rot:>7.1f}° {p.score:>7.3f}")
+            rot = _calculate_rotation(src.orientation, dst.orientation)
+            print(f"  {p.from_ref:<12} {p.to_ref:<12} ({avg_dx:>10,}, {avg_dy:>6,})  {rot:>7.1f}° {p.score:>7.3f}")
 
     if not dry_run:
         all_fps = list(board.get_footprints())
