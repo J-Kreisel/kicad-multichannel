@@ -1,4 +1,4 @@
-"""Read KiCad board groups as channels containing only footprints."""
+"""Read KiCad board groups as channels with footprints and simple routing."""
 
 from __future__ import annotations
 
@@ -27,6 +27,8 @@ class Footprint:
     layer: int
     pads: dict[str, int] = field(default_factory=dict)  # pad name -> type
     pad_nets: dict[str, str] = field(default_factory=dict)  # pad name -> net name
+    pad_positions: dict[str, tuple[int, int]] = field(default_factory=dict)  # pad name -> absolute nm
+    pad_offsets: dict[str, tuple[int, int]] = field(default_factory=dict)  # pad name -> footprint-local nm
     kid: str = ""
     raw: object = None
 
@@ -40,10 +42,30 @@ class Footprint:
 
 
 @dataclass
+class Track:
+    kid: str
+    net: str
+    start: tuple[int, int]
+    end: tuple[int, int]
+    raw: object
+
+
+@dataclass
+class Via:
+    kid: str
+    net: str
+    position: tuple[int, int]
+    raw: object
+
+
+@dataclass
 class Channel:
     name: str
     group_kid: str
     footprints: list[Footprint] = field(default_factory=list)
+    tracks: list[Track] = field(default_factory=list)
+    vias: list[Via] = field(default_factory=list)
+    raw_group: object = None
 
     @property
     def fp_by_ref(self) -> dict[str, Footprint]:
@@ -87,6 +109,10 @@ def _degrees(angle) -> float:
     return float(getattr(angle, "value_degrees", 0.0) or 0.0)
 
 
+def _net_name(net) -> str:
+    return str(getattr(net, "name", "") or "")
+
+
 def _field_text(field) -> str:
     try:
         return str(field.text.text.text)
@@ -109,12 +135,31 @@ def _footprint_id(definition) -> str:
     return entry or nick or ""
 
 
+def _rotate_offset(offset: tuple[int, int], orientation: float) -> tuple[int, int]:
+    x, y = offset
+    rot_rad = math.radians(orientation)
+    return (
+        int(round(x * math.cos(rot_rad) + y * math.sin(rot_rad))),
+        int(round(-x * math.sin(rot_rad) + y * math.cos(rot_rad))),
+    )
+
+
+def _local_pad_offset(fp_position: tuple[int, int], orientation: float, pad_position) -> tuple[int, int]:
+    pad_x, pad_y = _nm(pad_position)
+    world_offset = (pad_x - fp_position[0], pad_y - fp_position[1])
+    return _rotate_offset(world_offset, -orientation)
+
+
 def _extract_footprint(fp_wrapper) -> Footprint | None:
     try:
         p = fp_wrapper.proto
         reference = _field_text(p.reference_field)
         pads: dict[str, int] = {}
         pad_nets: dict[str, str] = {}
+        pad_positions: dict[str, tuple[int, int]] = {}
+        pad_offsets: dict[str, tuple[int, int]] = {}
+        position = _nm(p.position)
+        orientation = _degrees(p.orientation)
 
         for item in p.definition.items:
             if not item.type_url.endswith("kiapi.board.types.Pad"):
@@ -125,20 +170,53 @@ def _extract_footprint(fp_wrapper) -> Footprint | None:
             pads[name] = int(proto_pad.type)
             if proto_pad.net and proto_pad.net.name:
                 pad_nets[name] = str(proto_pad.net.name)
+            pad_positions[name] = _nm(proto_pad.position)
+            pad_offsets[name] = _local_pad_offset(position, orientation, proto_pad.position)
 
         return Footprint(
             reference=reference,
             footprint_id=_footprint_id(p.definition),
-            position=_nm(p.position),
-            orientation=_degrees(p.orientation),
+            position=position,
+            orientation=orientation,
             layer=int(p.layer),
             pads=pads,
             pad_nets=pad_nets,
+            pad_positions=pad_positions,
+            pad_offsets=pad_offsets,
             kid=_kid(p.id),
             raw=fp_wrapper,
         )
     except Exception as exc:
         _log.warning("footprint extraction failed: %s", exc)
+        return None
+
+
+def _extract_track(track_wrapper) -> Track | None:
+    try:
+        p = track_wrapper.proto
+        return Track(
+            kid=_kid(p.id),
+            net=_net_name(p.net),
+            start=_nm(p.start),
+            end=_nm(p.end),
+            raw=track_wrapper,
+        )
+    except Exception as exc:
+        _log.warning("track extraction failed: %s", exc)
+        return None
+
+
+def _extract_via(via_wrapper) -> Via | None:
+    try:
+        p = via_wrapper.proto
+        return Via(
+            kid=_kid(p.id),
+            net=_net_name(p.net),
+            position=_nm(p.position),
+            raw=via_wrapper,
+        )
+    except Exception as exc:
+        _log.warning("via extraction failed: %s", exc)
         return None
 
 
@@ -150,15 +228,44 @@ def read_channels(board: Board) -> list[Channel]:
         if fp is not None
     }
 
+    tracks = {
+        track.kid: track
+        for track in (_extract_track(t) for t in board.get_items(types=[KiCadObjectType.KOT_PCB_TRACE]))
+        if track is not None
+    }
+    vias = {
+        via.kid: via
+        for via in (_extract_via(v) for v in board.get_items(types=[KiCadObjectType.KOT_PCB_VIA]))
+        if via is not None
+    }
+
     groups = board.get_items(types=[KiCadObjectType.KOT_PCB_GROUP])
     channels: list[Channel] = []
     for g in groups:
         name = str(g.proto.name).strip() or "<unnamed>"
         member_kids = [_kid(kiid) for kiid in g.proto.items]
         group_fps = [fps[k] for k in member_kids if k in fps]
+        group_tracks = [tracks[k] for k in member_kids if k in tracks]
+        group_vias = [vias[k] for k in member_kids if k in vias]
         if not group_fps:
             continue
-        channels.append(Channel(name=name, group_kid=_kid(g.proto.id), footprints=group_fps))
+        channels.append(
+            Channel(
+                name=name,
+                group_kid=_kid(g.proto.id),
+                footprints=group_fps,
+                tracks=group_tracks,
+                vias=group_vias,
+                raw_group=g,
+            )
+        )
 
-    _log.info("read_channels: %d groups, %d channels, %d footprints", len(groups), len(channels), len(fps))
+    _log.info(
+        "read_channels: %d groups, %d channels, %d footprints, %d tracks, %d vias",
+        len(groups),
+        len(channels),
+        len(fps),
+        len(tracks),
+        len(vias),
+    )
     return channels

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy footprint placement from one channel (first named) to the others.
+"""Copy placement and verified routing from one channel to the others.
 
 Examples:
 
@@ -19,11 +19,14 @@ import sys
 from collections import defaultdict
 
 from kipy import KiCad
+from kipy.board_types import Track as BoardTrack, Via as BoardVia
+from kipy.common_types import Vector2
 from kipy.errors import ConnectionError as KipyConnectionError
 import kipy.geometry as geom
+from kipy.proto.common.types import KiCadObjectType
 
 from multichannel_layout.board_reader import Channel, read_channels
-from multichannel_layout.matching import Match, match_channels
+from multichannel_layout.matching import Match, footprint_score, match_channels, pad_pairs
 
 
 def _find_channel(channels: list[Channel], name: str) -> Channel | None:
@@ -64,6 +67,17 @@ def _apply_transform(x: int, y: int, rot: float, center_x: int, center_y: int, d
     return new_x, new_y, new_rot
 
 
+def _transform_point_nm(x: int, y: int, center_x: int, center_y: int, dx: int, dy: int, rotation: float) -> tuple[int, int]:
+    """Apply the placement transform to a board point and return nanometers."""
+    rel_x = x - center_x
+    rel_y = y - center_y
+    rot_rad = math.radians(rotation)
+    return (
+        int(round(center_x + rel_x * math.cos(rot_rad) + rel_y * math.sin(rot_rad) + dx)),
+        int(round(center_y - rel_x * math.sin(rot_rad) + rel_y * math.cos(rot_rad) + dy)),
+    )
+
+
 def _calculate_transform(src_x: int, src_y: int, src_rot: float, dst_x: int, dst_y: int, dst_rot: float, center_x: int, center_y: int) -> tuple[int, int, float]:
     """Calculate the transform (dx, dy, rotation) from source to destination around a center."""
     rotation = dst_rot - src_rot
@@ -94,6 +108,236 @@ def _round_to_nearest_90(rotation: float) -> int:
     if rounded > 180:
         rounded -= 360
     return int(rounded)
+
+
+def _verified_net_mappings(main: Channel, target: Channel, pairs: list[Match]) -> dict[str, str]:
+    """Map routed source nets whose every channel pad has a compatible target pad."""
+    routed_nets = {item.net for item in [*main.tracks, *main.vias] if item.net}
+    pair_by_source = {
+        pair.from_ref: pair.to_ref
+        for pair in pairs
+        if pair.is_matched
+    }
+    mappings: dict[str, str] = {}
+
+    for source_net in routed_nets:
+        target_nets: set[str] = set()
+        source_pad_count = 0
+        matched_pad_count = 0
+        valid = True
+        for source_fp in main.footprints:
+            target_ref = pair_by_source.get(source_fp.reference)
+            target_fp = target.fp_by_ref.get(target_ref) if target_ref else None
+            paired_pads = dict(pad_pairs(source_fp, target_fp)) if target_fp else {}
+
+            for source_pad, pad_net in source_fp.pad_nets.items():
+                if pad_net != source_net:
+                    continue
+                source_pad_count += 1
+                target_pad = paired_pads.get(source_pad)
+                if (
+                    target_fp is None
+                    or target_pad is None
+                    or footprint_score(source_fp, target_fp) < 0.95
+                ):
+                    valid = False
+                    continue
+                target_net = target_fp.pad_nets.get(target_pad, "")
+                if not target_net:
+                    valid = False
+                    continue
+                target_nets.add(target_net)
+                matched_pad_count += 1
+
+        if valid and source_pad_count > 0 and matched_pad_count == source_pad_count and len(target_nets) == 1:
+            mappings[source_net] = target_nets.pop()
+
+    duplicate_targets = {
+        target_net
+        for target_net in mappings.values()
+        if sum(value == target_net for value in mappings.values()) > 1
+    }
+    return {
+        source_net: target_net
+        for source_net, target_net in mappings.items()
+        if target_net not in duplicate_targets
+    }
+
+
+def _copy_routing_items(
+    main: Channel,
+    net_mappings: dict[str, str],
+    center_x: int,
+    center_y: int,
+    dx: int,
+    dy: int,
+    rotation: float,
+    nets_by_name: dict[str, object],
+) -> list[object]:
+    copies: list[object] = []
+    for source_track in main.tracks:
+        target_net = net_mappings.get(source_track.net)
+        if target_net is None or target_net not in nets_by_name:
+            continue
+        copy = BoardTrack(proto=source_track.raw.proto)
+        copy.proto.id.value = ""
+        copy.start = Vector2.from_xy(*_transform_point_nm(*source_track.start, center_x, center_y, dx, dy, rotation))
+        copy.end = Vector2.from_xy(*_transform_point_nm(*source_track.end, center_x, center_y, dx, dy, rotation))
+        copy.net = nets_by_name[target_net]
+        copies.append(copy)
+
+    for source_via in main.vias:
+        target_net = net_mappings.get(source_via.net)
+        if target_net is None or target_net not in nets_by_name:
+            continue
+        copy = BoardVia(proto=source_via.raw.proto)
+        copy.proto.id.value = ""
+        copy.position = Vector2.from_xy(*_transform_point_nm(*source_via.position, center_x, center_y, dx, dy, rotation))
+        copy.net = nets_by_name[target_net]
+        copies.append(copy)
+    return copies
+
+
+def _routing_signature(item) -> tuple:
+    if isinstance(item, BoardTrack):
+        endpoints = sorted(((item.start.x, item.start.y), (item.end.x, item.end.y)))
+        return ("track", item.net.name, item.layer, item.width, *endpoints)
+    if isinstance(item, BoardVia):
+        return ("via", item.net.name, item.position.x, item.position.y, item.type)
+    raise TypeError(f"unsupported routing item: {type(item).__name__}")
+
+
+def _find_existing_routing_copies(
+    board,
+    copies: list[object],
+    excluded_ids: set[str],
+) -> list[object]:
+    """Find exact copies from an earlier run, including ungrouped routing."""
+    wanted = {_routing_signature(item) for item in copies}
+    if not wanted:
+        return []
+    existing = board.get_items(
+        types=[KiCadObjectType.KOT_PCB_TRACE, KiCadObjectType.KOT_PCB_VIA]
+    )
+    return [
+        item
+        for item in existing
+        if item.id.value not in excluded_ids and _routing_signature(item) in wanted
+    ]
+
+
+def _add_routing_to_group(board, group_kid: str, routing: list[object]) -> None:
+    """Add already-committed routing items to a fully hydrated group."""
+    if not routing:
+        return
+
+    group = next(
+        (candidate for candidate in board.get_groups() if candidate.id.value == group_kid),
+        None,
+    )
+    if group is None:
+        raise RuntimeError(f"target group {group_kid} not found")
+
+    existing_ids = {item.id.value for item in group.items}
+    group.items = [
+        *group.items,
+        *(item for item in routing if item.id.value not in existing_ids),
+    ]
+
+    commit = board.begin_commit()
+    try:
+        board.update_items(group)
+        board.push_commit(commit)
+    except Exception:
+        board.drop_commit(commit)
+        raise
+
+    expected_ids = {item.id.value for item in routing}
+    persisted_group = next(
+        (
+            item
+            for item in board.get_items(types=[KiCadObjectType.KOT_PCB_GROUP])
+            if item.proto.id.value == group_kid
+        ),
+        None,
+    )
+    persisted_ids = {
+        item_id.value for item_id in persisted_group.proto.items
+    } if persisted_group is not None else set()
+    if not expected_ids.issubset(persisted_ids):
+        raise RuntimeError("KiCad did not persist routing group membership")
+
+
+def _replace_routing(
+    board,
+    main: Channel,
+    target: Channel,
+    net_mappings: dict[str, str],
+    center_x: int,
+    center_y: int,
+    dx: int,
+    dy: int,
+    rotation: float,
+) -> tuple[int, int]:
+    """Replace routing in a separate commit, changing only routing group IDs."""
+    if not net_mappings:
+        return 0, 0
+
+    nets_by_name = {net.name: net for net in board.get_nets()}
+    missing_nets = set(net_mappings.values()) - set(nets_by_name)
+    if missing_nets:
+        raise RuntimeError(f"target nets not found on board: {sorted(missing_nets)}")
+
+    target_routed_nets = set(net_mappings.values())
+    grouped_old_routing = [
+        item.raw
+        for item in [*target.tracks, *target.vias]
+        if item.net in target_routed_nets
+    ]
+    new_routing = _copy_routing_items(
+        main,
+        net_mappings,
+        center_x,
+        center_y,
+        dx,
+        dy,
+        rotation,
+        nets_by_name,
+    )
+    source_routing_ids = {
+        item.raw.id.value
+        for item in [*main.tracks, *main.vias]
+    }
+    exact_old_copies = _find_existing_routing_copies(
+        board,
+        new_routing,
+        source_routing_ids,
+    )
+    old_routing_by_id = {
+        item.id.value: item
+        for item in [*grouped_old_routing, *exact_old_copies]
+    }
+    old_routing = list(old_routing_by_id.values())
+
+    commit = board.begin_commit()
+    try:
+        if old_routing:
+            board.remove_items(old_routing)
+        created_routing = board.create_items(new_routing) if new_routing else []
+        if len(created_routing) != len(new_routing):
+            raise RuntimeError(
+                f"KiCad created {len(created_routing)}/{len(new_routing)} routing items"
+            )
+        board.push_commit(commit)
+    except Exception:
+        board.drop_commit(commit)
+        raise
+
+    _add_routing_to_group(board, target.group_kid, created_routing)
+
+    track_count = sum(isinstance(item, BoardTrack) for item in created_routing)
+    via_count = sum(isinstance(item, BoardVia) for item in created_routing)
+    return track_count, via_count
 
 
 def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run: bool, verbose: bool, board) -> int:
@@ -151,6 +395,18 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
 
     print(f"  chosen offset: ({avg_dx:,}, {avg_dy:,}) nm, rotation: {avg_rot:.1f}°")
 
+    net_mappings = _verified_net_mappings(main, target, pairs)
+    target_routed_nets = set(net_mappings.values())
+    source_track_count = sum(track.net in net_mappings for track in main.tracks)
+    source_via_count = sum(via.net in net_mappings for via in main.vias)
+    replaced_track_count = sum(track.net in target_routed_nets for track in target.tracks)
+    replaced_via_count = sum(via.net in target_routed_nets for via in target.vias)
+    print(
+        f"  routing: {len(net_mappings)} verified nets, "
+        f"replace {replaced_track_count} tracks/{replaced_via_count} vias with "
+        f"{source_track_count} tracks/{source_via_count} vias"
+    )
+
     if verbose:
         print(f"  {'SOURCE':<12} {'TARGET':<12} {'INDIV_OFFSET':>18} {'ROT':>8} {'SCORE':>8}")
         print(f"  {'-'*64}")
@@ -192,7 +448,28 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
                 board.drop_commit(commit)
                 return 0
         else:
+            board.drop_commit(commit)
             print("  no footprints to update")
+            return 0
+
+        try:
+            track_count, via_count = _replace_routing(
+                board,
+                main,
+                target,
+                net_mappings,
+                center_x,
+                center_y,
+                avg_dx,
+                avg_dy,
+                avg_rot,
+            )
+            print(
+                f"  replaced routing with {track_count} tracks and "
+                f"{via_count} vias"
+            )
+        except Exception as exc:
+            print(f"  Error replacing routing: {exc}")
         return len(updated_wrappers)
 
     return sum(1 for p in pairs if p.is_matched)
@@ -200,7 +477,7 @@ def _process_target(main: Channel, target: Channel, bucket_size_nm: int, dry_run
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Copy footprint placement from the first channel to all other named channels."
+        description="Copy placement and verified routing from the first channel to the others."
     )
     parser.add_argument("channels", nargs="*", help="First channel = source; remaining = targets")
     parser.add_argument("--dry-run", action="store_true", help="Print matchings/offsets without writing")
