@@ -1,23 +1,31 @@
 # KiCad Multichannel Layout
 
-Minimal footprint-only channel copier. Pick one source channel and any number
-of target channels; the tool matches footprints pairwise and copies the
-relative placement from the source.
+Multichannel placement and routing copier. Pick one source channel and any
+number of target channels; the tool matches footprints pairwise, copies their
+relative placement, and replaces safely matched target routing.
 
 ## How it works
 
 1. **Channel list** — the first named group is the source/main channel; all
    following groups are targets.
-2. **Matching** — iteratively lock the least-ambiguous source↔target pair and
-   re-score the rest using net topology and relative placement of already
-   locked pairs.
+2. **Matching** — reject pairs below 95% pad-layout compatibility, then
+   iteratively lock the least-ambiguous pair. Each pad whose net relationship
+   agrees with already locked pairs contributes `+1 / pad count`; a
+   contradiction contributes `-1 / pad count`, with the net score floored at
+   zero. Placement is only a tiebreaker.
 3. **Offset voting** — each matched pair votes for an offset bucket. The bucket
    with the most votes wins; ties are broken by picking the bucket whose
    average movement is closest to the overall mean movement.
-4. **Copy** — every matched target footprint is moved to
-   `source_position + chosen_offset` and gets the source rotation.
+4. **Copy placement** — every matched target footprint is moved using the
+   chosen translation and rotation.
+5. **Replace routing** — for each routed source net, every source-group pad on
+   that net must map to a pad on one target net through the accepted footprint
+   matches. Existing tracks and vias for that net inside the target group are
+   then removed and replaced by transformed copies from the source group.
 
-Tracks/zones are ignored completely.
+Routing outside the target group is not removed. Zones and routed arcs are
+ignored. Group membership is changed only for replaced and newly created
+tracks/vias; footprints, rule areas, and all other group members are preserved.
 
 ## Usage
 
@@ -48,8 +56,8 @@ external run, copy them from a plugin log or launch the shell from KiCad).
 ## Files
 
 - `multichannel_layout.py` — CLI entry point.
-- `multichannel_layout/board_reader.py` — reads KiCad groups → `Channel` with
-  footprints only.
+- `multichannel_layout/board_reader.py` — reads KiCad groups into channels with
+  footprints, straight tracks, and vias.
 - `multichannel_layout/matching.py` — iterative ambiguity-first matcher.
 - `flake.nix` / `.envrc` — dev shell with `kicad-python`.
 

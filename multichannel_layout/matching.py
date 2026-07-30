@@ -1,33 +1,16 @@
-"""Iterative, ambiguity-first matching between two channels.
-
-1. Score every source/target footprint pair (pad count, footprint id, pad
-   names/types, reference prefix).
-2. Lock the pair whose best candidate is most clearly better than its
-   second-best candidate on both sides.
-3. Re-score remaining pairs using already-locked pairs for net-topology and
-   relative-placement context.
-4. Stop when the best remaining pair is too ambiguous/low-score.
-"""
+"""Iterative footprint matching using pad shape, mapped nets, and placement."""
 
 from __future__ import annotations
 
-import logging
 import re
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from math import hypot
 from typing import Optional
 
 from .board_reader import Channel, Footprint
 
-_log = logging.getLogger(__name__)
-
-# Stop threshold
-_MIN_SCORE = 0.45
-
-# Context weights added after locking pairs
-_W_NET = 0.30
-_W_PLACE = 0.20
+_MIN_FOOTPRINT_SCORE = 0.95
+_SCORE_EPSILON = 1e-9
 
 
 @dataclass
@@ -41,243 +24,230 @@ class Match:
         return self.from_ref is not None and self.to_ref is not None
 
 
-def _similarity(a: str, b: str) -> float:
-    if not a and not b:
-        return 1.0
-    if not a or not b:
-        return 0.0
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+def _natural_key(value: str) -> list[tuple[int, object]]:
+    return [
+        (0, int(part)) if part.isdigit() else (1, part.lower())
+        for part in re.split(r"(\d+)", value)
+        if part
+    ]
 
 
-_REFDES_RE = re.compile(r"^([A-Za-z]+)(\d.*)?$")
-
-
-def _split_ref(ref: str) -> tuple[str, str]:
-    m = _REFDES_RE.match(ref)
-    return (m.group(1), m.group(2) or "") if m else (ref, "")
-
-
-def _shape_class(lib_id: str) -> str:
-    if not lib_id:
-        return ""
-    name = lib_id.split(":")[-1]
-    name = re.sub(r"_.*$", "", name)
-    m = re.match(
-        r"^(DIP|SOIC|TQFP|VQFP|LQFP|QFP|BGA|SOT|QFN|DFN|TO|SIP|DPAK|"
-        r"TSSOP|SSOP|MSOP|VSSOP|PLCC|LLCC|CLCC|QFN-)",
-        name,
-        re.IGNORECASE,
-    )
-    if m:
-        return m.group(1).upper()
-    return name.split("-")[0].upper() if "-" in name else name.upper()
-
-
-_SHAPE_FAMILIES = {
-    "DIP": {"DIP", "SOIC", "SOP", "TSSOP", "SSOP", "MSOP", "VSSOP", "SOT23", "SOT"},
-    "QFP": {"QFP", "TQFP", "VQFP", "LQFP"},
-    "QFN": {"QFN", "DFN", "QFN-", "DFN-"},
-}
-
-
-def _same_shape_family(a: str, b: str) -> bool:
-    if not a or not b:
-        return True
-    if a == b:
-        return True
-    for family in _SHAPE_FAMILIES.values():
-        if a in family and b in family:
-            return True
-    return False
-
-
-def _pad_score(a: Footprint, b: Footprint) -> float:
+def pad_pairs(a: Footprint, b: Footprint) -> list[tuple[str, str]]:
+    """Pair pads by number when possible, otherwise by natural ordering."""
     if len(a.pads) != len(b.pads):
-        return 0.0
-    if not a.pads:
+        return []
+    if set(a.pads) == set(b.pads):
+        return [(name, name) for name in sorted(a.pads, key=_natural_key)]
+    return list(
+        zip(
+            sorted(a.pads, key=_natural_key),
+            sorted(b.pads, key=_natural_key),
+        )
+    )
+
+
+def _layout_scale(a: Footprint, b: Footprint) -> float:
+    points = list(a.pad_offsets.values()) + list(b.pad_offsets.values())
+    if not points:
         return 1.0
-
-    a_names = sorted(a.pads.keys(), key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)])
-    b_names = sorted(b.pads.keys(), key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)])
-
-    total = 0.0
-    for na, nb in zip(a_names, b_names):
-        name_sim = _similarity(na, nb)
-        type_eq = 1.0 if a.pads[na] == b.pads[nb] else 0.0
-        total += 0.5 * name_sim + 0.5 * type_eq
-    return total / len(a_names)
+    width = max(x for x, _ in points) - min(x for x, _ in points)
+    height = max(y for _, y in points) - min(y for _, y in points)
+    return max(hypot(width, height), 1_000_000.0)
 
 
 def footprint_score(a: Footprint, b: Footprint) -> float:
-    """Pairwise footprint similarity in [0, 1]."""
+    """Return normalized pad compatibility, with different pad counts rejected."""
+    pairs = pad_pairs(a, b)
     if len(a.pads) != len(b.pads):
         return 0.0
+    if not pairs:
+        return 1.0
 
-    sa = _shape_class(a.footprint_id)
-    sb = _shape_class(b.footprint_id)
-    if not _same_shape_family(sa, sb):
-        return 0.0
-
-    score = 0.0
-
-    if a.footprint_id and b.footprint_id:
-        if a.footprint_id == b.footprint_id:
-            score += 0.40
-        else:
-            score += 0.20 * _similarity(a.footprint_id.split(":")[-1], b.footprint_id.split(":")[-1])
-
-    if a.pads and b.pads:
-        score += 0.20 * _pad_score(a, b)
-
-    prefix_a, suffix_a = _split_ref(a.reference)
-    prefix_b, suffix_b = _split_ref(b.reference)
-    if prefix_a and prefix_a == prefix_b:
-        score += 0.10
-        if suffix_a and suffix_a == suffix_b:
-            score += 0.05
-
-    if a.pad_nets and b.pad_nets:
-        common = set(a.pad_nets.values()) & set(b.pad_nets.values())
-        union = set(a.pad_nets.values()) | set(b.pad_nets.values())
-        if union:
-            score += 0.05 * len(common) / len(union)
-
-    return min(score, 1.0)
-
-
-def _net_context(a: Footprint, b: Footprint, source: Channel, target: Channel, locked: list[tuple[str, str]]) -> float:
-    if not locked:
-        return 0.0
-    support = 0
-    for c_ref, d_ref in locked:
-        c = source.fp_by_ref[c_ref]
-        d = target.fp_by_ref[d_ref]
-        pads = set(a.pad_nets) & set(c.pad_nets) & set(b.pad_nets) & set(d.pad_nets)
-        for pad in pads:
-            if a.pad_nets[pad] == c.pad_nets[pad] and b.pad_nets[pad] == d.pad_nets[pad]:
-                support += 1
-    return min(1.0, support * 0.25)
-
-
-def _place_context(a: Footprint, b: Footprint, source: Channel, target: Channel, locked: list[tuple[str, str]]) -> float:
-    if not locked:
-        return 0.0
+    scale = _layout_scale(a, b)
     total = 0.0
-    for c_ref, d_ref in locked:
-        c = source.fp_by_ref[c_ref]
-        d = target.fp_by_ref[d_ref]
+    for a_pad, b_pad in pairs:
+        number_score = 1.0 if a_pad == b_pad else 0.0
+        type_score = 1.0 if a.pads[a_pad] == b.pads[b_pad] else 0.0
+        ax, ay = a.pad_offsets.get(a_pad, (0, 0))
+        bx, by = b.pad_offsets.get(b_pad, (0, 0))
+        distance_score = max(0.0, 1.0 - hypot(ax - bx, ay - by) / scale)
+        total += 0.45 * number_score + 0.20 * type_score + 0.35 * distance_score
+    return total / len(pairs)
 
-        nets_ac = set(a.pad_nets.values()) & set(c.pad_nets.values())
-        nets_bd = set(b.pad_nets.values()) & set(d.pad_nets.values())
-        if not nets_ac or not nets_bd:
+
+def _net_score(
+    a: Footprint,
+    b: Footprint,
+    source: Channel,
+    target: Channel,
+    locked: list[tuple[str, str]],
+) -> float:
+    """Score agreement with locked net relationships by +/- one per pad."""
+    pairs = pad_pairs(a, b)
+    if not pairs or not locked:
+        return 0.0
+
+    locked_pairs = [
+        (source.fp_by_ref[a_ref], target.fp_by_ref[b_ref])
+        for a_ref, b_ref in locked
+    ]
+    score = 0.0
+    per_pad = 1.0 / len(pairs)
+    for a_pad, b_pad in pairs:
+        a_net = a.pad_nets.get(a_pad, "")
+        b_net = b.pad_nets.get(b_pad, "")
+        if not a_net or not b_net:
             continue
 
-        dx1, dy1 = c.x - a.x, c.y - a.y
-        dx2, dy2 = d.x - b.x, d.y - b.y
-        n1 = hypot(dx1, dy1)
-        n2 = hypot(dx2, dy2)
+        source_connections: set[tuple[int, str]] = set()
+        target_connections: set[tuple[int, str]] = set()
+        for index, (locked_a, locked_b) in enumerate(locked_pairs):
+            for locked_a_pad, locked_b_pad in pad_pairs(locked_a, locked_b):
+                if locked_a.pad_nets.get(locked_a_pad) == a_net:
+                    source_connections.add((index, locked_a_pad))
+                if locked_b.pad_nets.get(locked_b_pad) == b_net:
+                    target_connections.add((index, locked_a_pad))
 
-        if n1 == 0 and n2 == 0:
-            sim = 1.0
-        elif n1 == 0 or n2 == 0:
-            sim = 0.0
-        else:
-            dist_sim = max(0.0, 1.0 - abs(n1 - n2) / (n1 + n2))
-            cos = (dx1 * dx2 + dy1 * dy2) / (n1 * n2)
-            cos_sim = (cos + 1.0) / 2.0
-            sim = 0.5 * dist_sim + 0.5 * cos_sim
-        total += sim
+        if not source_connections and not target_connections:
+            continue
+        score += per_pad if source_connections == target_connections else -per_pad
 
-    return min(1.0, total / max(len(locked), 1))
+    return max(0.0, score)
+
+
+def _position_score(
+    a: Footprint,
+    b: Footprint,
+    source: Channel,
+    target: Channel,
+    locked: list[tuple[str, str]],
+) -> float:
+    """Compare distance to locked pairs; this is only a final tiebreaker."""
+    if not locked:
+        source_center = source.center
+        target_center = target.center
+        source_distance = hypot(a.x - source_center[0], a.y - source_center[1])
+        target_distance = hypot(b.x - target_center[0], b.y - target_center[1])
+        denominator = max(source_distance, target_distance, 1.0)
+        return max(0.0, 1.0 - abs(source_distance - target_distance) / denominator)
+
+    scores: list[float] = []
+    for source_ref, target_ref in locked:
+        locked_a = source.fp_by_ref[source_ref]
+        locked_b = target.fp_by_ref[target_ref]
+        source_distance = hypot(a.x - locked_a.x, a.y - locked_a.y)
+        target_distance = hypot(b.x - locked_b.x, b.y - locked_b.y)
+        denominator = max(source_distance, target_distance, 1.0)
+        scores.append(max(0.0, 1.0 - abs(source_distance - target_distance) / denominator))
+    return sum(scores) / len(scores)
+
+
+def _ambiguity(
+    pair: tuple[str, str],
+    scores: dict[tuple[str, str], float],
+) -> float:
+    """Return bidirectional competition relative to this candidate's net score."""
+    source_ref, target_ref = pair
+    score = scores[pair]
+    source_alternatives = [
+        value for (a_ref, b_ref), value in scores.items()
+        if a_ref == source_ref and b_ref != target_ref
+    ]
+    target_alternatives = [
+        value for (a_ref, b_ref), value in scores.items()
+        if b_ref == target_ref and a_ref != source_ref
+    ]
+
+    def competition(alternatives: list[float]) -> float:
+        if not alternatives:
+            return 0.0
+        alternative = max(alternatives)
+        if score <= _SCORE_EPSILON:
+            return 1.0 if alternative <= _SCORE_EPSILON else float("inf")
+        return alternative / score
+
+    source_competition = competition(source_alternatives)
+    target_competition = competition(target_alternatives)
+    return (source_competition + target_competition) / 2.0
 
 
 def match_channels(source: Channel, target: Channel) -> list[Match]:
-    """Match footprints from source to target."""
-    if not source.footprints or not target.footprints:
-        return []
-
-    src = source.fp_by_ref
-    tgt = target.fp_by_ref
-
-    base_scores: dict[tuple[str, str], float] = {
-        (a_ref, b_ref): footprint_score(a, b)
-        for a_ref, a in src.items()
-        for b_ref, b in tgt.items()
+    """Match footprints, locking the least ambiguous eligible pair each round."""
+    source_by_ref = source.fp_by_ref
+    target_by_ref = target.fp_by_ref
+    footprint_scores = {
+        (source_ref, target_ref): footprint_score(source_fp, target_fp)
+        for source_ref, source_fp in source_by_ref.items()
+        for target_ref, target_fp in target_by_ref.items()
     }
 
     locked: list[tuple[str, str]] = []
-    locked_score: dict[tuple[str, str], float] = {}
-    matched_src: set[str] = set()
-    matched_tgt: set[str] = set()
+    locked_scores: dict[tuple[str, str], float] = {}
+    matched_source: set[str] = set()
+    matched_target: set[str] = set()
 
     while True:
-        src_open = {r for r in src if r not in matched_src}
-        tgt_open = {r for r in tgt if r not in matched_tgt}
-        if not src_open or not tgt_open:
-            break
-
-        candidates: dict[tuple[str, str], float] = {}
-        candidate_base: dict[tuple[str, str], float] = {}
-        for a_ref in src_open:
-            for b_ref in tgt_open:
-                base = base_scores.get((a_ref, b_ref), 0.0)
-                if base <= 0.0:
-                    continue
-                a, b = src[a_ref], tgt[b_ref]
-                total = base + _W_NET * _net_context(a, b, source, target, locked) + _W_PLACE * _place_context(a, b, source, target, locked)
-                candidates[(a_ref, b_ref)] = total
-                candidate_base[(a_ref, b_ref)] = base
-
+        candidates = {
+            pair: base_score
+            for pair, base_score in footprint_scores.items()
+            if pair[0] not in matched_source
+            and pair[1] not in matched_target
+            and base_score >= _MIN_FOOTPRINT_SCORE
+        }
         if not candidates:
             break
 
-        by_src: dict[str, list[float]] = {}
-        by_tgt: dict[str, list[float]] = {}
-        for (a_ref, b_ref), sc in candidates.items():
-            by_src.setdefault(a_ref, []).append(sc)
-            by_tgt.setdefault(b_ref, []).append(sc)
+        net_scores = {
+            pair: _net_score(
+                source_by_ref[pair[0]],
+                target_by_ref[pair[1]],
+                source,
+                target,
+                locked,
+            )
+            for pair in candidates
+        }
+        ambiguities = {pair: _ambiguity(pair, net_scores) for pair in candidates}
+        best_ambiguity = min(ambiguities.values())
+        ambiguity_ties = [
+            pair for pair, value in ambiguities.items()
+            if abs(value - best_ambiguity) <= _SCORE_EPSILON
+        ]
 
-        def ambiguity(a_ref: str, b_ref: str) -> float:
-            def ratio(second: float, best: float) -> float:
-                return second / (best + 1e-9)
+        position_scores = {
+            pair: _position_score(
+                source_by_ref[pair[0]],
+                target_by_ref[pair[1]],
+                source,
+                target,
+                locked,
+            )
+            for pair in ambiguity_ties
+        }
+        best_pair = max(
+            ambiguity_ties,
+            key=lambda pair: (
+                position_scores[pair],
+                net_scores[pair],
+                candidates[pair],
+                pair,
+            ),
+        )
 
-            s = sorted(by_src[a_ref], reverse=True)
-            best_a, second_a = s[0], (s[1] if len(s) > 1 else 0.0)
-            s = sorted(by_tgt[b_ref], reverse=True)
-            best_b, second_b = s[0], (s[1] if len(s) > 1 else 0.0)
-            return (ratio(second_a, best_a) + ratio(second_b, best_b)) / 2.0
-
-        best_pair: tuple[str, str] | None = None
-        best_ambiguity = float("inf")
-        best_score = 0.0
-        for pair, sc in candidates.items():
-            # Skip if base score is too low
-            if candidate_base[pair] < _MIN_SCORE:
-                continue
-            amb = ambiguity(*pair)
-            if amb < best_ambiguity - 1e-9 or (abs(amb - best_ambiguity) < 1e-9 and sc > best_score):
-                best_pair = pair
-                best_ambiguity = amb
-                best_score = sc
-
-        if best_pair is None:
-            break
-
-        a_ref, b_ref = best_pair
-        matched_src.add(a_ref)
-        matched_tgt.add(b_ref)
+        matched_source.add(best_pair[0])
+        matched_target.add(best_pair[1])
         locked.append(best_pair)
-        locked_score[best_pair] = best_score
+        locked_scores[best_pair] = candidates[best_pair] + net_scores[best_pair]
 
     matches: list[Match] = []
-    for a_ref in src:
-        if a_ref in matched_src:
-            b_ref = next(b for a, b in locked if a == a_ref)
-            matches.append(Match(a_ref, b_ref, locked_score[(a_ref, b_ref)]))
+    locked_by_source = dict(locked)
+    for source_ref in source_by_ref:
+        target_ref = locked_by_source.get(source_ref)
+        if target_ref is None:
+            matches.append(Match(source_ref, None, 0.0))
         else:
-            matches.append(Match(a_ref, None, 0.0))
-    for b_ref in tgt:
-        if b_ref not in matched_tgt:
-            matches.append(Match(None, b_ref, 0.0))
-
+            matches.append(Match(source_ref, target_ref, locked_scores[(source_ref, target_ref)]))
+    for target_ref in target_by_ref:
+        if target_ref not in matched_target:
+            matches.append(Match(None, target_ref, 0.0))
     return matches
