@@ -226,13 +226,46 @@ def _find_existing_routing_copies(
     ]
 
 
-def _update_group_routing_ids(group, old_ids: set[str], routing: list[object]) -> None:
-    """Apply only the routing member delta to a group proto."""
-    for index in range(len(group.proto.items) - 1, -1, -1):
-        if group.proto.items[index].value in old_ids:
-            del group.proto.items[index]
-    for item in routing:
-        group.proto.items.add().CopyFrom(item.id)
+def _add_routing_to_group(board, group_kid: str, routing: list[object]) -> None:
+    """Add already-committed routing items to a fully hydrated group."""
+    if not routing:
+        return
+
+    group = next(
+        (candidate for candidate in board.get_groups() if candidate.id.value == group_kid),
+        None,
+    )
+    if group is None:
+        raise RuntimeError(f"target group {group_kid} not found")
+
+    existing_ids = {item.id.value for item in group.items}
+    group.items = [
+        *group.items,
+        *(item for item in routing if item.id.value not in existing_ids),
+    ]
+
+    commit = board.begin_commit()
+    try:
+        board.update_items(group)
+        board.push_commit(commit)
+    except Exception:
+        board.drop_commit(commit)
+        raise
+
+    expected_ids = {item.id.value for item in routing}
+    persisted_group = next(
+        (
+            item
+            for item in board.get_items(types=[KiCadObjectType.KOT_PCB_GROUP])
+            if item.proto.id.value == group_kid
+        ),
+        None,
+    )
+    persisted_ids = {
+        item_id.value for item_id in persisted_group.proto.items
+    } if persisted_group is not None else set()
+    if not expected_ids.issubset(persisted_ids):
+        raise RuntimeError("KiCad did not persist routing group membership")
 
 
 def _replace_routing(
@@ -286,19 +319,6 @@ def _replace_routing(
     }
     old_routing = list(old_routing_by_id.values())
 
-    group = next(
-        (
-            item
-            for item in board.get_items(types=[KiCadObjectType.KOT_PCB_GROUP])
-            if item.proto.id.value == target.group_kid
-        ),
-        None,
-    )
-    if group is None:
-        raise RuntimeError(f"target group {target.group_kid} not found")
-
-    old_ids = set(old_routing_by_id)
-
     commit = board.begin_commit()
     try:
         if old_routing:
@@ -308,13 +328,12 @@ def _replace_routing(
             raise RuntimeError(
                 f"KiCad created {len(created_routing)}/{len(new_routing)} routing items"
             )
-
-        _update_group_routing_ids(group, old_ids, created_routing)
-        board.update_items(group)
         board.push_commit(commit)
     except Exception:
         board.drop_commit(commit)
         raise
+
+    _add_routing_to_group(board, target.group_kid, created_routing)
 
     track_count = sum(isinstance(item, BoardTrack) for item in created_routing)
     via_count = sum(isinstance(item, BoardVia) for item in created_routing)
