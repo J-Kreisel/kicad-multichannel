@@ -53,4 +53,3 @@ def calculate_match_transforms(
         )
         for _, source_fp, target_fp in matches
     ]
-

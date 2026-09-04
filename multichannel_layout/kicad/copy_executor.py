@@ -2,33 +2,23 @@
 
 from __future__ import annotations
 
-import re
-
 import kipy.geometry as geom
 from kipy.board_types import Track as BoardTrack, Via as BoardVia
 from kipy.common_types import Vector2
-from kipy.proto.common.commands.editor_commands_pb2 import (
-    RunAction,
-    RunActionResponse,
-    RunActionStatus,
+from kipy.proto.common.types import KiCadObjectType
+
+from ..domain.models import Channel, UpdatePlan, UpdateResult
+from ..domain.transforms import transform_from_origins, transform_point
+from .groups import (
+    GroupTopology,
+    GroupTopologyManager,
+    expected_topology,
+    item_id,
+    leave_active_groups,
+    read_group_topology,
+    topology_errors,
 )
-from kipy.proto.common.types import KIID, KiCadObjectType
-
-from .board_reader import read_board_snapshot
-from .group_topology import GroupTopology, expected_topology, topology_errors
-from .models import Channel, GroupSnapshot, UpdatePlan, UpdateResult
-from .transforms import transform_from_origins, transform_point
-
-
-_UUID_RE = re.compile(
-    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
-)
-
-
-def _item_id(obj) -> str:
-    value = str(getattr(obj, "value", obj))
-    match = _UUID_RE.search(value)
-    return match.group(1) if match else value.strip()
+from .reader import read_board_snapshot
 
 
 def _find_channel(channels: tuple[Channel, ...], name: str) -> Channel:
@@ -40,80 +30,32 @@ def _find_channel(channels: tuple[Channel, ...], name: str) -> Channel:
     return matches[0]
 
 
-def _topology_and_groups(board) -> tuple[GroupTopology, dict[str, object]]:
-    groups = board.get_items(types=[KiCadObjectType.KOT_PCB_GROUP])
-    wrappers = {_item_id(group.proto.id): group for group in groups}
-    topology = GroupTopology(
-        tuple(
-            GroupSnapshot(
-                group_id=group_id,
-                name=str(group.proto.name),
-                member_ids=tuple(_item_id(item_id) for item_id in group.proto.items),
-            )
-            for group_id, group in wrappers.items()
-        )
-    )
-    return topology, wrappers
-
-
-def _replace_group_members(board, group, wanted: GroupSnapshot) -> None:
-    member_ids = [KIID(value=item_id) for item_id in wanted.member_ids]
-    members = list(board.get_items_by_id(member_ids)) if member_ids else []
-    resolved_ids = {_item_id(item.id) for item in members}
-    missing_ids = set(wanted.member_ids) - resolved_ids
-    if missing_ids:
-        raise RuntimeError(
-            f"could not resolve members for group {wanted.name!r}: {sorted(missing_ids)}"
-        )
-    group.proto.name = wanted.name
-    group.items = members
-
-
-def _leave_active_groups(board) -> None:
-    """Exit all nested group-edit contexts before IPC mutations."""
-    group_count = len(
-        board.get_items(types=[KiCadObjectType.KOT_PCB_GROUP])
-    )
-    test_adapter = getattr(board, "leave_active_group", None)
-    for _ in range(group_count):
-        if test_adapter is not None:
-            test_adapter()
-            continue
-        command = RunAction(action="common.Interactive.groupLeave")
-        response = board._kicad.send(command, RunActionResponse)
-        if response.status == RunActionStatus.RAS_INVALID:
-            break
-        if response.status != RunActionStatus.RAS_OK:
-            raise RuntimeError(
-                "KiCad could not leave the active group before updating"
-            )
-
-
 class KiCadBoardExecutor:
     """Keep every KiCad wrapper behind an apply(plan) boundary."""
 
     def __init__(self, board):
         self._board = board
+        self._group_manager = GroupTopologyManager(board)
 
     def apply(self, plan: UpdatePlan) -> UpdateResult:
         """Resolve all board objects internally and apply one source-target plan."""
-        _leave_active_groups(self._board)
+        leave_active_groups(self._board)
         snapshot = read_board_snapshot(self._board)
         source = _find_channel(snapshot.channels, plan.source_channel)
         target = _find_channel(snapshot.channels, plan.target_channel)
-        before, _ = _topology_and_groups(self._board)
+        before, _ = read_group_topology(self._board)
         self._validate_plan(plan, source, target, before)
 
         footprints = {
-            _item_id(item.id): item
+            item_id(item.id): item
             for item in self._board.get_footprints()
         }
         tracks = {
-            _item_id(item.id): item
+            item_id(item.id): item
             for item in self._board.get_items(types=[KiCadObjectType.KOT_PCB_TRACE])
         }
         vias = {
-            _item_id(item.id): item
+            item_id(item.id): item
             for item in self._board.get_items(types=[KiCadObjectType.KOT_PCB_VIA])
         }
         nets = {net.name: net for net in self._board.get_nets()}
@@ -165,18 +107,18 @@ class KiCadBoardExecutor:
 
         wanted = expected_topology(
             before,
-            {_item_id(item.id) for item in remove_items},
-            {target.group_kid: tuple(_item_id(item.id) for item in created)},
+            {item_id(item.id) for item in remove_items},
+            {target.group_kid: tuple(item_id(item.id) for item in created)},
         )
         try:
-            self._repair_topology(wanted)
+            self._group_manager.repair(wanted)
         except Exception as exc:
             raise RuntimeError(
                 f"object changes were committed, but group restoration failed: {exc}; "
                 "undo until the 'Update multichannel objects' step is reverted"
             ) from exc
 
-        actual, _ = _topology_and_groups(self._board)
+        actual, _ = read_group_topology(self._board)
         errors = topology_errors(wanted, actual)
         if errors:
             raise RuntimeError(
@@ -333,84 +275,3 @@ class KiCadBoardExecutor:
             raise RuntimeError(
                 f"KiCad updated {len(result)}/{len(footprints)} footprints"
             )
-
-    def _repair_topology(self, wanted: GroupTopology) -> int:
-        """Commit removals before additions until KiCad's parent links settle."""
-        commit_count = 0
-        for _ in range(6):
-            actual, _ = _topology_and_groups(self._board)
-            self._assert_same_groups(wanted, actual)
-
-            removals: list[GroupSnapshot] = []
-            for group_id, expected_group in wanted.by_id.items():
-                current_group = actual.by_id[group_id]
-                expected_members = set(expected_group.member_ids)
-                retained_members = tuple(
-                    item_id
-                    for item_id in current_group.member_ids
-                    if item_id in expected_members
-                )
-                if len(retained_members) != len(current_group.member_ids):
-                    removals.append(
-                        GroupSnapshot(group_id, expected_group.name, retained_members)
-                    )
-            if removals:
-                self._commit_group_snapshots(removals, "Detach misplaced group items")
-                commit_count += 1
-                continue
-
-            additions = [
-                expected_group
-                for group_id, expected_group in wanted.by_id.items()
-                if (
-                    actual.by_id[group_id].name != expected_group.name
-                    or set(actual.by_id[group_id].member_ids)
-                    != set(expected_group.member_ids)
-                )
-            ]
-            if additions:
-                self._commit_group_snapshots(additions, "Restore multichannel groups")
-                commit_count += 1
-                continue
-            return commit_count
-
-        actual, _ = _topology_and_groups(self._board)
-        errors = topology_errors(wanted, actual)
-        raise RuntimeError("group topology did not stabilize: " + "; ".join(errors))
-
-    def _commit_group_snapshots(
-        self,
-        snapshots: list[GroupSnapshot],
-        message: str,
-    ) -> None:
-        commit = self._board.begin_commit()
-        try:
-            wrappers = {
-                _item_id(group.id): group
-                for group in self._board.get_groups()
-            }
-            changed = []
-            for snapshot in snapshots:
-                wrapper = wrappers.get(snapshot.group_id)
-                if wrapper is None:
-                    raise RuntimeError(f"group no longer exists: {snapshot.group_id}")
-                _replace_group_members(self._board, wrapper, snapshot)
-                changed.append(wrapper)
-            self._update_groups(changed)
-            self._board.push_commit(commit, message)
-        except Exception:
-            self._board.drop_commit(commit)
-            raise
-
-    @staticmethod
-    def _assert_same_groups(wanted: GroupTopology, actual: GroupTopology) -> None:
-        if set(wanted.by_id) != set(actual.by_id):
-            errors = topology_errors(wanted, actual)
-            raise RuntimeError("group topology changed: " + "; ".join(errors))
-
-    def _update_groups(self, groups: list[object]) -> None:
-        if not groups:
-            return
-        result = self._board.update_items(groups)
-        if len(result) != len(groups):
-            raise RuntimeError(f"KiCad updated {len(result)}/{len(groups)} groups")

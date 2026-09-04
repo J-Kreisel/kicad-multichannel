@@ -1,7 +1,7 @@
 import unittest
 
-from multichannel_layout.models import BoardTransform
-from multichannel_layout.transforms import (
+from multichannel_layout.domain.models import BoardTransform
+from multichannel_layout.domain.transforms import (
     calculate_transform,
     choose_consensus_transform,
     transform_from_origins,

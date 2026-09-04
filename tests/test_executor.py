@@ -6,8 +6,10 @@ from kipy.common_types import Vector2
 from kipy.proto.board.board_types_pb2 import Group as ProtoGroup
 from kipy.proto.common.types import KIID, KiCadObjectType
 
-from multichannel_layout.executor import KiCadBoardExecutor
-from multichannel_layout.models import UpdatePlan
+from multichannel_layout.domain.models import UpdatePlan
+from multichannel_layout.kicad.copy_executor import KiCadBoardExecutor
+from multichannel_layout.membership.executor import MembershipExecutor
+from multichannel_layout.membership.models import MembershipPlan
 
 
 def group(group_id, name, members):
@@ -76,6 +78,8 @@ class FakeBoard:
             return self.footprints
         if types == [KiCadObjectType.KOT_PCB_TRACE]:
             return self.tracks
+        if types == [KiCadObjectType.KOT_PCB_ARC]:
+            return []
         if types == [KiCadObjectType.KOT_PCB_VIA]:
             return []
         raise AssertionError(types)
@@ -192,6 +196,49 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(result.locked_net_count, 1)
         self.assertFalse(board.committed)
         self.assertEqual({track.id.value for track in board.tracks}, {"source-track", "old-track"})
+
+    def test_membership_executor_skips_items_in_foreign_groups(self):
+        board = FakeBoard()
+        plan = MembershipPlan("CH2", add_item_ids=("source-track",))
+
+        result = MembershipExecutor(board).apply(plan)
+
+        memberships = {
+            board_group.id.value: {member.value for member in board_group.proto.items}
+            for board_group in board.groups
+        }
+        self.assertIn("source-track", memberships["source-group"])
+        self.assertNotIn("source-track", memberships["target-group"])
+        self.assertEqual(result.added_count, 0)
+
+    def test_membership_executor_adds_ungrouped_item(self):
+        board = FakeBoard()
+        loose_track = BoardTrack()
+        loose_track.proto.id.value = "loose-track"
+        board.tracks.append(loose_track)
+        plan = MembershipPlan("CH2", add_item_ids=("loose-track",))
+
+        result = MembershipExecutor(board).apply(plan)
+
+        memberships = {
+            board_group.id.value: {member.value for member in board_group.proto.items}
+            for board_group in board.groups
+        }
+        self.assertIn("loose-track", memberships["target-group"])
+        self.assertEqual(result.added_count, 1)
+
+    def test_membership_executor_removes_item_from_target_group(self):
+        board = FakeBoard()
+        plan = MembershipPlan("CH2", remove_item_ids=("old-track",))
+
+        result = MembershipExecutor(board).apply(plan)
+
+        memberships = {
+            board_group.id.value: {member.value for member in board_group.proto.items}
+            for board_group in board.groups
+        }
+        self.assertNotIn("old-track", memberships["target-group"])
+        self.assertEqual(result.removed_count, 1)
 
 
 if __name__ == "__main__":

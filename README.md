@@ -1,8 +1,9 @@
 # KiCad Multichannel Layout
 
-Multichannel placement and routing copier. Pick one source channel and any
-number of target channels; the tool matches footprints pairwise, copies their
-relative placement, and replaces safely matched target routing.
+Multichannel placement and routing copier plus routing membership repair tools.
+`copy` matches footprints pairwise, copies their relative placement, and
+replaces safely matched target routing. `add-membership` / `remove-membership`
+fix which routing tracks and vias belong to a channel group.
 
 ## How it works
 
@@ -78,26 +79,62 @@ do not participate in bucketing. Multiple locked anchors must describe exactly
 the same rigid transform. Conflicting anchors, or a locked target footprint
 without a source match, make planning fail before the board is modified.
 
+## Routing membership repair
+
+`add-membership` fixes a channel that was routed without entering the group:
+routing that physically connects the group's pads exists, but is not a group
+member. `remove-membership` is the inverse: the group contains routing that is
+not needed for its own internal connectivity (for example routing that was
+drawn while still inside the group, continuing across the board).
+
+Both commands use the same analysis:
+
+1. Collect all pads of the group's footprints and their nets.
+2. Ignore nets whose pads are entirely inside the group.
+3. On the remaining nets, find pads outside the group and build copper islands
+   from tracks, vias, and arcs. Islands are purely physical: a shared net name
+   without a physical connection is not connectivity, and zones never connect
+   anything.
+4. Only islands containing both internal and external pads are relevant.
+5. Within such an island, all internal pads must stay mutually connected.
+   Starting from the island's copper, each track/via is tentatively removed
+   (deterministic order) and restored if that would disconnect internal pads
+   from each other.
+
+For `add-membership`, the surviving copper that is not already in the group is
+added (existing group routing is protected). For `remove-membership`, group
+routing outside the surviving core loses its membership. Copper is never moved
+or deleted, and locked routing is never changed. Copper belonging to another
+group is skipped rather than stolen.
+
 ## Usage
 
 Inside the Nix flake dev shell (`direnv` loads it automatically):
 
 ```sh
 # list available channel groups
-python multichannel_layout.py --list
+python multichannel_layout.py list
 
 # preview matchings and offsets for CH1 -> CH2, CH3, CH4
-python multichannel_layout.py CH1 CH2 CH3 CH4 --dry-run
+python multichannel_layout.py copy CH1 CH2 CH3 CH4 --dry-run
 
-# verbose: print every matched pair and its individual offset
-python multichannel_layout.py CH1 CH3 --dry-run --verbose
+# verbose: print every matched pair
+python multichannel_layout.py copy CH1 CH3 --dry-run --verbose
 
-# actually copy placement
-python multichannel_layout.py CH1 CH2 CH3 CH4
+# actually copy placement and routing
+python multichannel_layout.py copy CH1 CH2 CH3 CH4
+
+# preview which routing would be added to / removed from the group
+python multichannel_layout.py add-membership CH1 --dry-run --verbose
+python multichannel_layout.py remove-membership CH1 --dry-run --verbose
+
+# apply membership changes
+python multichannel_layout.py add-membership CH1
+python multichannel_layout.py remove-membership CH1
 ```
 
-The offset bucket size defaults to 0.5 mm (500 000 nm). Override with
-`--bucket-size NM`.
+`copy` keeps the `--bucket-size` / `--ignore` options; both membership
+commands support `--dry-run` and `--verbose`.
 
 Because this talks to KiCad over the IPC API, you still need a running PCB
 editor with the API enabled and the env vars `KICAD_API_SOCKET` /
@@ -106,19 +143,18 @@ external run, copy them from a plugin log or launch the shell from KiCad).
 
 ## Files
 
+The package is split into three layers:
+
 - `multichannel_layout.py` — minimal executable entry point.
-- `multichannel_layout/cli.py` — argument parsing and reporting.
-- `multichannel_layout/models.py` — KiCad-independent snapshots and plans.
-- `multichannel_layout/board_reader.py` — reads channels and complete group UUID
-  membership.
-- `multichannel_layout/matching.py` — iterative ambiguity-first matcher.
-- `multichannel_layout/transforms.py` — pure placement geometry.
-- `multichannel_layout/placement.py` — matched-footprint geometry helpers.
-- `multichannel_layout/origins.py` — name-based origin and bucket resolution.
-- `multichannel_layout/routing.py` — verified net and routing planning.
-- `multichannel_layout/planner.py` — builds the complete `UpdatePlan`.
-- `multichannel_layout/group_topology.py` — group invariants and expected state.
-- `multichannel_layout/executor.py` — the only KiCad mutation boundary.
+- `multichannel_layout/cli.py` — subcommand parsing and reporting.
+- `multichannel_layout/domain/` — KiCad-independent logic: board snapshots,
+  matching, origins/bucketing, geometry, and update planning.
+- `multichannel_layout/kicad/` — IPC adapters: reading boards, group topology
+  management, and executors that apply domain plans.
+- `multichannel_layout/membership/` — routing connectivity models, island
+  analysis, membership planning, and its executor.
+- `tests/` — unit tests for geometry, planning, group invariants, and
+  membership analysis.
 - `flake.nix` / `.envrc` — dev shell with `kicad-python`.
 
 ## License

@@ -4,13 +4,13 @@ from kipy.board_types import Group
 from kipy.proto.board.board_types_pb2 import Group as ProtoGroup
 from kipy.proto.common.types import KIID, KiCadObjectType
 
-from multichannel_layout.executor import KiCadBoardExecutor
-from multichannel_layout.group_topology import (
+from multichannel_layout.kicad.groups import (
     GroupTopology,
+    GroupTopologyManager,
     expected_topology,
     topology_errors,
 )
-from multichannel_layout.models import GroupSnapshot
+from multichannel_layout.domain.models import GroupSnapshot
 
 
 class GroupTopologyTests(unittest.TestCase):
@@ -128,7 +128,7 @@ class GroupTopologyTests(unittest.TestCase):
             )
         )
 
-        KiCadBoardExecutor(board)._repair_topology(wanted)
+        GroupTopologyManager(board).repair(wanted)
 
         target_members = tuple(item.value for item in board.groups[0].proto.items)
         active_members = tuple(item.value for item in board.groups[1].proto.items)

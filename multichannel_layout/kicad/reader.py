@@ -10,7 +10,7 @@ from kipy.board import Board
 from kipy.proto.board.board_types_pb2 import Pad as ProtoPad
 from kipy.proto.common.types import KiCadObjectType
 
-from .models import BoardSnapshot, Channel, Footprint, GroupSnapshot, Track, Via
+from ..domain.models import BoardSnapshot, Channel, Footprint, GroupSnapshot, Track, Via
 
 _log = logging.getLogger(__name__)
 

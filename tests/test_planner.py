@@ -2,8 +2,8 @@ import json
 import unittest
 from dataclasses import asdict
 
-from multichannel_layout.models import Channel, Footprint, Track, Via
-from multichannel_layout.planner import UpdatePlanner
+from multichannel_layout.domain.models import Channel, Footprint, Track, Via
+from multichannel_layout.domain.planner import UpdatePlanner
 
 
 def footprint(reference, kid, position, orientation, net, *, locked=False, pad_count=1):

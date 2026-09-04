@@ -1,7 +1,7 @@
 """KiCad Multichannel Layout package."""
 
-from .models import UpdatePlan
-from .planner import UpdatePlanner
+from .domain.models import UpdatePlan
+from .domain.planner import UpdatePlanner
 
 
 __all__ = ["UpdatePlan", "UpdatePlanner"]
