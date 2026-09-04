@@ -5,84 +5,18 @@ from __future__ import annotations
 import logging
 import math
 import re
-from dataclasses import dataclass, field
 
 from kipy.board import Board
 from kipy.proto.board.board_types_pb2 import Pad as ProtoPad
 from kipy.proto.common.types import KiCadObjectType
+
+from .models import BoardSnapshot, Channel, Footprint, GroupSnapshot, Track, Via
 
 _log = logging.getLogger(__name__)
 
 _UUID_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
-
-
-@dataclass
-class Footprint:
-    reference: str
-    footprint_id: str
-    position: tuple[int, int]  # nm
-    orientation: float         # degrees
-    layer: int
-    pads: dict[str, int] = field(default_factory=dict)  # pad name -> type
-    pad_nets: dict[str, str] = field(default_factory=dict)  # pad name -> net name
-    pad_positions: dict[str, tuple[int, int]] = field(default_factory=dict)  # pad name -> absolute nm
-    pad_offsets: dict[str, tuple[int, int]] = field(default_factory=dict)  # pad name -> footprint-local nm
-    kid: str = ""
-    raw: object = None
-
-    @property
-    def x(self) -> int:
-        return self.position[0]
-
-    @property
-    def y(self) -> int:
-        return self.position[1]
-
-
-@dataclass
-class Track:
-    kid: str
-    net: str
-    start: tuple[int, int]
-    end: tuple[int, int]
-    raw: object
-
-
-@dataclass
-class Via:
-    kid: str
-    net: str
-    position: tuple[int, int]
-    raw: object
-
-
-@dataclass
-class Channel:
-    name: str
-    group_kid: str
-    footprints: list[Footprint] = field(default_factory=list)
-    tracks: list[Track] = field(default_factory=list)
-    vias: list[Via] = field(default_factory=list)
-    raw_group: object = None
-
-    @property
-    def fp_by_ref(self) -> dict[str, Footprint]:
-        return {fp.reference: fp for fp in self.footprints}
-
-    @property
-    def fp_by_kid(self) -> dict[str, Footprint]:
-        return {fp.kid: fp for fp in self.footprints}
-
-    @property
-    def center(self) -> tuple[int, int]:
-        """Geometric center of all footprints (average position)."""
-        if not self.footprints:
-            return (0, 0)
-        avg_x = sum(fp.x for fp in self.footprints) // len(self.footprints)
-        avg_y = sum(fp.y for fp in self.footprints) // len(self.footprints)
-        return (avg_x, avg_y)
 
 
 def _kid(obj) -> str:
@@ -184,7 +118,7 @@ def _extract_footprint(fp_wrapper) -> Footprint | None:
             pad_positions=pad_positions,
             pad_offsets=pad_offsets,
             kid=_kid(p.id),
-            raw=fp_wrapper,
+            locked=bool(fp_wrapper.locked),
         )
     except Exception as exc:
         _log.warning("footprint extraction failed: %s", exc)
@@ -199,7 +133,6 @@ def _extract_track(track_wrapper) -> Track | None:
             net=_net_name(p.net),
             start=_nm(p.start),
             end=_nm(p.end),
-            raw=track_wrapper,
         )
     except Exception as exc:
         _log.warning("track extraction failed: %s", exc)
@@ -213,15 +146,14 @@ def _extract_via(via_wrapper) -> Via | None:
             kid=_kid(p.id),
             net=_net_name(p.net),
             position=_nm(p.position),
-            raw=via_wrapper,
         )
     except Exception as exc:
         _log.warning("via extraction failed: %s", exc)
         return None
 
 
-def read_channels(board: Board) -> list[Channel]:
-    """Return one Channel per board group that contains footprints."""
+def read_board_snapshot(board: Board) -> BoardSnapshot:
+    """Read algorithm inputs and complete group memberships from KiCad."""
     fps = {
         fp.kid: fp
         for fp in (_extract_footprint(f) for f in board.get_items(types=[KiCadObjectType.KOT_PCB_FOOTPRINT]))
@@ -240,6 +172,14 @@ def read_channels(board: Board) -> list[Channel]:
     }
 
     groups = board.get_items(types=[KiCadObjectType.KOT_PCB_GROUP])
+    group_snapshots = tuple(
+        GroupSnapshot(
+            group_id=_kid(group.proto.id),
+            name=str(group.proto.name),
+            member_ids=tuple(_kid(item_id) for item_id in group.proto.items),
+        )
+        for group in groups
+    )
     channels: list[Channel] = []
     for g in groups:
         name = str(g.proto.name).strip() or "<unnamed>"
@@ -256,7 +196,6 @@ def read_channels(board: Board) -> list[Channel]:
                 footprints=group_fps,
                 tracks=group_tracks,
                 vias=group_vias,
-                raw_group=g,
             )
         )
 
@@ -268,4 +207,9 @@ def read_channels(board: Board) -> list[Channel]:
         len(tracks),
         len(vias),
     )
-    return channels
+    return BoardSnapshot(channels=tuple(channels), groups=group_snapshots)
+
+
+def read_channels(board: Board) -> list[Channel]:
+    """Return one Channel per board group that contains footprints."""
+    return list(read_board_snapshot(board).channels)

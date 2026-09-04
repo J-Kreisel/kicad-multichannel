@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from math import hypot
 from typing import Optional
 
-from .board_reader import Channel, Footprint
+from .models import Channel, Footprint
 
 _MIN_FOOTPRINT_SCORE = 0.95
 _SCORE_EPSILON = 1e-9
