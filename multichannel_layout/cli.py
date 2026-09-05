@@ -53,7 +53,7 @@ def _print_copy_plan(plan: UpdatePlan, verbose: bool) -> None:
 def _print_membership_plan(plan: MembershipPlan, verbose: bool) -> None:
     print(f"\n{plan.group_name}")
     print(f"  mixed nets: {plan.mixed_net_count}")
-    print(f"  connected mixed islands: {plan.island_count}")
+    print(f"  candidate copper islands: {plan.island_count}")
     print(f"  add routing items: {len(plan.add_item_ids)}")
     print(f"  remove routing items: {len(plan.remove_item_ids)}")
     print(f"  locked routing items observed: {plan.locked_item_count}")

@@ -87,25 +87,25 @@ member. `remove-membership` is the inverse: the group contains routing that is
 not needed for its own internal connectivity (for example routing that was
 drawn while still inside the group, continuing across the board).
 
-Both commands use the same analysis:
+Both commands start with the same physical connectivity analysis:
 
 1. Collect all pads of the group's footprints and their nets.
-2. Ignore nets whose pads are entirely inside the group.
-3. On the remaining nets, find pads outside the group and build copper islands
-   from tracks, vias, and arcs. Islands are purely physical: a shared net name
-   without a physical connection is not connectivity, and zones never connect
-   anything.
-4. Only islands containing both internal and external pads are relevant.
-5. Within such an island, all internal pads must stay mutually connected.
+2. Build copper islands from tracks, vias, arcs, and pads. Islands are purely
+   physical: a shared net name without a physical connection is not
+   connectivity, and zones never connect anything. Empty/no-net pads and
+   copper still participate through their physical contacts.
+3. Within a candidate island, all internal pads must stay mutually connected.
    Starting from the island's copper, each track/via is tentatively removed
    (deterministic order) and restored if that would disconnect internal pads
    from each other.
 
-For `add-membership`, the surviving copper that is not already in the group is
-added (existing group routing is protected). For `remove-membership`, group
-routing outside the surviving core loses its membership. Copper is never moved
-or deleted, and locked routing is never changed. Copper belonging to another
-group is skipped rather than stolen.
+For `add-membership`, every island with at least two internal pads is a
+candidate, including internal-only and no-net islands. The surviving copper
+that is not already in the group is added, while existing group routing is
+protected. For `remove-membership`, only islands containing both internal and
+external pads are candidates; group routing outside the surviving core loses
+its membership. Copper is never moved or deleted, and locked routing is never
+changed. Copper belonging to another group is skipped rather than stolen.
 
 ## Usage
 

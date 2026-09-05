@@ -79,7 +79,7 @@ class MembershipPlannerTests(unittest.TestCase):
             {"core-a", "core-b", "outside-branch"},
         )
 
-    def test_same_net_without_physical_external_connection_is_ignored(self):
+    def test_remove_ignores_internal_island_disconnected_from_external_pad(self):
         disconnected_pads = [
             pad("pad-a", "fp-in-a", "N", (0, 0)),
             pad("pad-b", "fp-in-b", "N", (10, 0)),
@@ -87,17 +87,17 @@ class MembershipPlannerTests(unittest.TestCase):
         ]
         disconnected_copper = [track("internal", "N", (0, 0), (10, 0))]
         snapshot = board(
-            ("fp-in-a", "fp-in-b"),
+            ("fp-in-a", "fp-in-b", "internal"),
             disconnected_pads,
             disconnected_copper,
         )
 
-        plan = build_membership_plan(snapshot, "CH1", "add")
+        plan = build_membership_plan(snapshot, "CH1", "remove")
 
         self.assertEqual(plan.island_count, 0)
         self.assertEqual(plan.add_item_ids, ())
 
-    def test_internal_only_net_is_ignored(self):
+    def test_add_includes_internal_only_net(self):
         snapshot = board(
             ("fp-in-a", "fp-in-b"),
             self.pads[:2],
@@ -107,7 +107,30 @@ class MembershipPlannerTests(unittest.TestCase):
         plan = build_membership_plan(snapshot, "CH1", "add")
 
         self.assertEqual(plan.mixed_net_count, 0)
-        self.assertEqual(plan.add_item_ids, ())
+        self.assertEqual(set(plan.add_item_ids), {"core-a", "core-b"})
+
+    def test_remove_ignores_internal_only_net(self):
+        snapshot = board(
+            ("fp-in-a", "fp-in-b", "core-a", "core-b"),
+            self.pads[:2],
+            self.copper[:2],
+        )
+
+        plan = build_membership_plan(snapshot, "CH1", "remove")
+
+        self.assertEqual(plan.remove_item_ids, ())
+
+    def test_add_supports_no_net_pad_connection(self):
+        pads = [
+            pad("pad-a", "fp-in-a", "", (0, 0)),
+            pad("pad-b", "fp-in-b", "", (10, 0)),
+        ]
+        copper = [track("no-net-track", "", (0, 0), (10, 0))]
+        snapshot = board(("fp-in-a", "fp-in-b"), pads, copper)
+
+        plan = build_membership_plan(snapshot, "CH1", "add")
+
+        self.assertEqual(plan.add_item_ids, ("no-net-track",))
 
     def test_track_endpoint_on_another_track_forms_a_junction(self):
         junction_copper = [

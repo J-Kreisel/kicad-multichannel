@@ -36,8 +36,6 @@ def read_membership_board(board) -> MembershipBoard:
                 continue
             pad = ProtoPad()
             packed_item.Unpack(pad)
-            if not pad.net.name:
-                continue
             pad_id = item_id(pad.id) or f"{footprint_id}:{pad.number}"
             pads.append(
                 MembershipPad(

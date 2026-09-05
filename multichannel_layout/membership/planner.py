@@ -31,8 +31,8 @@ def build_membership_plan(
         if pad.footprint_id not in member_ids and pad.net in internal_nets
     ]
     mixed_nets = {pad.net for pad in external_pads}
-    pads = [pad for pad in board.pads if pad.net in mixed_nets]
-    copper = [item for item in board.copper if item.net in mixed_nets]
+    pads = [pad for pad in board.pads if pad.net in internal_nets]
+    copper = [item for item in board.copper if item.net in internal_nets]
     adjacency = build_adjacency(pads, copper)
     pad_by_id = {pad.item_id: pad for pad in pads}
     copper_by_id = {item.item_id: item for item in copper}
@@ -46,7 +46,9 @@ def build_membership_plan(
     for component in connected_components(adjacency):
         island_internal = component & internal_pad_ids
         island_external = component & external_pad_ids
-        if not island_internal or not island_external:
+        if mode == "add" and len(island_internal) < 2:
+            continue
+        if mode == "remove" and (not island_internal or not island_external):
             continue
         island_count += 1
         island_copper = component & set(copper_by_id)
