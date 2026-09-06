@@ -13,7 +13,7 @@ from .domain.models import Channel, UpdatePlan
 from .domain.planner import UpdatePlanner
 from .kicad.copy_executor import KiCadBoardExecutor
 from .kicad.membership_reader import read_membership_board
-from .kicad.reader import read_board_snapshot
+from .kicad.reader import read_board_snapshot, read_channel_summaries
 from .membership.executor import MembershipExecutor
 from .membership.models import MembershipPlan
 from .membership.planner import build_membership_plan
@@ -211,7 +211,7 @@ def _run_copy(args, board, channels: list[Channel]) -> int:
 def _run_membership(args, board, mode: str) -> int:
     try:
         plan = build_membership_plan(read_membership_board(board), args.group, mode)
-    except (ValueError, RuntimeError) as exc:
+    except Exception as exc:
         print(f"Cannot plan membership update: {exc}", file=sys.stderr)
         return 9
     _print_membership_plan(plan, args.verbose)
@@ -248,13 +248,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "remove-membership":
         return _run_membership(args, board, "remove")
 
-    snapshot = read_board_snapshot(board)
-    channels = list(snapshot.channels)
     if args.command == "list":
         print("Channels:")
-        for channel in channels:
-            print(f"  {channel.name} ({len(channel.footprints)} footprints)")
+        for name, footprint_count in read_channel_summaries(board):
+            print(f"  {name} ({footprint_count} footprints)")
         return 0
+    try:
+        snapshot = read_board_snapshot(board)
+    except Exception as exc:
+        print(f"Could not safely read board: {exc}", file=sys.stderr)
+        return 3
+    channels = list(snapshot.channels)
     if not channels:
         print("No channel groups with footprints found.", file=sys.stderr)
         return 3

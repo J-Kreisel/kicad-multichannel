@@ -9,7 +9,7 @@ from .placement import (
     resolve_matched_footprints,
     source_center,
 )
-from .transforms import choose_consensus_transform, transform_point
+from .transforms import angular_distance, choose_consensus_transform, transform_point
 
 
 class ChannelOriginResolver:
@@ -85,7 +85,7 @@ class ChannelOriginResolver:
                     locked_transforms[1:],
                 )
                 if transform.translation != first_transform.translation
-                or abs(transform.rotation - first_transform.rotation) > 1e-9
+                or angular_distance(transform.rotation, first_transform.rotation) > 1e-9
             ]
             if conflicts:
                 anchor_reference = locked_matches[0][2].reference

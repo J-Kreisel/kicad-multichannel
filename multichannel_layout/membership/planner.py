@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .connectivity import build_adjacency, connected_components, internal_pads_connected
-from .models import MembershipBoard, MembershipPlan
+from .models import MembershipBoard, MembershipPlan, board_fingerprint
 
 
 def _find_group(board: MembershipBoard, group_name: str):
@@ -23,6 +23,12 @@ def build_membership_plan(
 
     group = _find_group(board, group_name)
     member_ids = set(group.member_ids)
+    foreign_member_ids = {
+        item_id
+        for other_group in board.groups
+        if other_group.group_id != group.group_id
+        for item_id in other_group.member_ids
+    }
     internal_pads = [pad for pad in board.pads if pad.footprint_id in member_ids]
     internal_nets = {pad.net for pad in internal_pads}
     external_pads = [
@@ -61,24 +67,21 @@ def build_membership_plan(
         locked_items.update(locked)
 
         if mode == "add":
-            locked_outside = locked - member_ids
-            active = set(island_copper) - locked_outside
+            unavailable_outside = (locked | foreign_member_ids) - member_ids
+            active = set(island_copper) - unavailable_outside
             if not internal_pads_connected(
                 island_internal, active, island_pads, adjacency
             ):
                 raise RuntimeError(
-                    f"locked copper outside {group_name!r} blocks membership for net "
+                    f"locked or foreign-group copper blocks membership for net "
                     f"{copper_by_id[min(island_copper)].net!r}"
                 )
             candidates = sorted(active - member_ids)
             protected = island_copper & member_ids
         else:
-            active = set(island_copper)
-            candidates = sorted(
-                active - locked,
-                key=lambda item_id: (item_id in member_ids, item_id),
-            )
-            protected = locked
+            active = set(island_copper) & member_ids
+            candidates = sorted(active - locked)
+            protected = locked & member_ids
 
         for item_id in candidates:
             if item_id in protected:
@@ -90,7 +93,7 @@ def build_membership_plan(
                 active.add(item_id)
 
         if mode == "add":
-            additions.update(active - member_ids - locked)
+            additions.update(active - member_ids - locked - foreign_member_ids)
         else:
             removals.update((island_copper & member_ids) - active - locked)
 
@@ -101,4 +104,5 @@ def build_membership_plan(
         mixed_net_count=len(mixed_nets),
         island_count=island_count,
         locked_item_count=len(locked_items),
+        board_fingerprint=board_fingerprint(board),
     )

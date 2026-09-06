@@ -62,7 +62,8 @@ UpdatePlan(
 
 The executor receives only this plan. It resolves group IDs, footprint IDs,
 routing objects, and lock state from the live board immediately before the
-update.
+update. Copy reads are fail-closed: malformed or disappearing footprints,
+tracks, and vias abort the operation instead of producing a partial copy.
 
 Origin calculation and offset bucketing are hidden behind the planner. Once it
 has the channel snapshots, callers only provide two names:
@@ -93,7 +94,9 @@ Both commands start with the same physical connectivity analysis:
 2. Build copper islands from tracks, vias, arcs, and pads. Islands are purely
    physical: a shared net name without a physical connection is not
    connectivity, and zones never connect anything. Empty/no-net pads and
-   copper still participate through their physical contacts.
+   copper still participate through their physical contacts. Connectivity uses
+   KiCad's layer-specific pad polygons, track/arc widths, via diameters, and
+   tessellated routed-arc centerlines. NPTH pads never bridge copper layers.
 3. Within a candidate island, all internal pads must stay mutually connected.
    Starting from the island's copper, each track/via is tentatively removed
    (deterministic order) and restored if that would disconnect internal pads
@@ -106,6 +109,10 @@ protected. For `remove-membership`, only islands containing both internal and
 external pads are candidates; group routing outside the surviving core loses
 its membership. Copper is never moved or deleted, and locked routing is never
 changed. Copper belonging to another group is skipped rather than stolen.
+Locked and foreign-group copper is excluded before pruning; if that leaves no
+valid internal path, planning fails instead of applying an incomplete result.
+Membership plans include a fingerprint of the board geometry, nets, locks, and
+group ownership and are rejected if the board changes before application.
 
 ## Usage
 

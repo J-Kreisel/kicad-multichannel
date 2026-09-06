@@ -205,13 +205,27 @@ class KiCadBoardExecutor:
         if missing_nets:
             raise RuntimeError(f"target nets no longer exist: {sorted(missing_nets)}")
 
+        expected_track_ids = {
+            item.kid for channel in (source, target) for item in channel.tracks
+        }
+        expected_via_ids = {
+            item.kid for channel in (source, target) for item in channel.vias
+        }
+        missing_track_ids = expected_track_ids - set(tracks)
+        missing_via_ids = expected_via_ids - set(vias)
+        if missing_track_ids or missing_via_ids:
+            raise RuntimeError(
+                "routing changed after planning; "
+                f"missing tracks={sorted(missing_track_ids)}, "
+                f"missing vias={sorted(missing_via_ids)}"
+            )
         source_items = [
-            *(tracks[item.kid] for item in source.tracks if item.kid in tracks),
-            *(vias[item.kid] for item in source.vias if item.kid in vias),
+            *(tracks[item.kid] for item in source.tracks),
+            *(vias[item.kid] for item in source.vias),
         ]
         target_items = [
-            *(tracks[item.kid] for item in target.tracks if item.kid in tracks),
-            *(vias[item.kid] for item in target.vias if item.kid in vias),
+            *(tracks[item.kid] for item in target.tracks),
+            *(vias[item.kid] for item in target.vias),
         ]
         available_source_nets = {item.net.name for item in source_items}
         missing_source_nets = set(mappings) - available_source_nets

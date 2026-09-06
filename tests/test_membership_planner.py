@@ -180,8 +180,31 @@ class MembershipPlannerTests(unittest.TestCase):
         ]
         snapshot = board(("fp-in-a", "fp-in-b"), self.pads, copper)
 
-        with self.assertRaisesRegex(RuntimeError, "locked copper"):
+        with self.assertRaisesRegex(RuntimeError, "locked or foreign-group copper"):
             build_membership_plan(snapshot, "CH1", "add")
+
+    def test_foreign_group_path_is_excluded_before_pruning(self):
+        pads = [
+            pad("pad-a", "fp-in-a", "N", (0, 0)),
+            pad("pad-b", "fp-in-b", "N", (20, 0)),
+        ]
+        copper = [
+            track("a-loose", "N", (0, 0), (10, 0)),
+            track("b-loose", "N", (10, 0), (20, 0)),
+            track("z-foreign", "N", (0, 0), (20, 0)),
+        ]
+        snapshot = MembershipBoard(
+            groups=(
+                GroupSnapshot("group-id", "CH1", ("fp-in-a", "fp-in-b")),
+                GroupSnapshot("foreign-id", "other", ("z-foreign",)),
+            ),
+            pads=tuple(pads),
+            copper=tuple(copper),
+        )
+
+        plan = build_membership_plan(snapshot, "CH1", "add")
+
+        self.assertEqual(set(plan.add_item_ids), {"a-loose", "b-loose"})
 
 
 if __name__ == "__main__":

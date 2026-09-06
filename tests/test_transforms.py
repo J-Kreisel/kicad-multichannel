@@ -48,6 +48,16 @@ class TransformTests(unittest.TestCase):
             (11_000_000, 11_000_000),
         )
 
+    def test_consensus_treats_positive_and_negative_180_as_equivalent(self):
+        transforms = [
+            BoardTransform((0, 0), (1_000_000, 2_000_000), 180),
+            BoardTransform((0, 0), (1_000_000, 2_000_000), -180),
+        ]
+
+        result = choose_consensus_transform(transforms, 500_000)
+
+        self.assertEqual(result.rotation, 180)
+
 
 if __name__ == "__main__":
     unittest.main()

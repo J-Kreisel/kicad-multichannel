@@ -11,7 +11,7 @@ from ..kicad.groups import (
     topology_errors,
 )
 from ..kicad.membership_reader import read_membership_board
-from .models import MembershipPlan, MembershipResult
+from .models import MembershipPlan, MembershipResult, board_fingerprint
 
 
 class MembershipExecutor:
@@ -33,6 +33,12 @@ class MembershipExecutor:
         target = matching_groups[0]
 
         live_board = read_membership_board(self._board)
+        if (
+            plan.board_fingerprint
+            and plan.board_fingerprint != board_fingerprint(live_board)
+        ):
+            raise RuntimeError("board changed after membership planning; run the command again")
+        live_copper_ids = {item.item_id for item in live_board.copper}
         locked_ids = {
             item.item_id for item in live_board.copper if item.locked
         }
@@ -42,8 +48,21 @@ class MembershipExecutor:
             if group.group_id != target.group_id
             for item_id in group.member_ids
         }
-        add_ids = set(plan.add_item_ids) - locked_ids - foreign_group_ids
-        remove_ids = set(plan.remove_item_ids) - locked_ids
+        planned_ids = set(plan.add_item_ids) | set(plan.remove_item_ids)
+        missing_ids = planned_ids - live_copper_ids
+        if missing_ids:
+            raise RuntimeError(f"planned routing items no longer exist: {sorted(missing_ids)}")
+        newly_locked = planned_ids & locked_ids
+        if newly_locked:
+            raise RuntimeError(f"planned routing items are now locked: {sorted(newly_locked)}")
+        foreign_additions = set(plan.add_item_ids) & foreign_group_ids
+        if foreign_additions:
+            raise RuntimeError(
+                "planned routing items now belong to another group: "
+                f"{sorted(foreign_additions)}"
+            )
+        add_ids = set(plan.add_item_ids)
+        remove_ids = set(plan.remove_item_ids)
         if not add_ids and not remove_ids:
             return MembershipResult(plan.group_name, 0, 0)
 

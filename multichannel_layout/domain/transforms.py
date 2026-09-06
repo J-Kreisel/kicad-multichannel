@@ -8,6 +8,23 @@ from collections import defaultdict
 from .models import BoardTransform, Origin, Point
 
 
+def normalize_angle(rotation: float) -> float:
+    normalized = (rotation + 180.0) % 360.0 - 180.0
+    return 180.0 if abs(normalized + 180.0) <= 1e-9 else normalized
+
+
+def angular_distance(left: float, right: float) -> float:
+    return abs(normalize_angle(left - right))
+
+
+def _circular_mean(rotations: list[float]) -> float:
+    sin_sum = sum(math.sin(math.radians(rotation)) for rotation in rotations)
+    cos_sum = sum(math.cos(math.radians(rotation)) for rotation in rotations)
+    if abs(sin_sum) <= 1e-12 and abs(cos_sum) <= 1e-12:
+        return normalize_angle(rotations[0])
+    return normalize_angle(math.degrees(math.atan2(sin_sum, cos_sum)))
+
+
 def transform_point(point: Point, transform: BoardTransform) -> Point:
     x, y = point
     center_x, center_y = transform.center
@@ -22,11 +39,7 @@ def transform_point(point: Point, transform: BoardTransform) -> Point:
 
 
 def transform_from_origins(source: Origin, target: Origin) -> BoardTransform:
-    rotation = target[2] - source[2]
-    while rotation > 180:
-        rotation -= 360
-    while rotation < -180:
-        rotation += 360
+    rotation = normalize_angle(target[2] - source[2])
     return BoardTransform(
         center=(source[0], source[1]),
         translation=(target[0] - source[0], target[1] - source[1]),
@@ -41,11 +54,7 @@ def calculate_transform(
     target_rotation: float,
     center: Point,
 ) -> BoardTransform:
-    rotation = target_rotation - source_rotation
-    while rotation > 180:
-        rotation -= 360
-    while rotation < -180:
-        rotation += 360
+    rotation = normalize_angle(target_rotation - source_rotation)
 
     source_x, source_y = source_position
     center_x, center_y = center
@@ -70,7 +79,7 @@ def _round_to_nearest_90(rotation: float) -> int:
         rounded = 0
     if rounded > 180:
         rounded -= 360
-    return int(rounded)
+    return int(normalize_angle(rounded))
 
 
 def choose_consensus_transform(
@@ -99,5 +108,5 @@ def choose_consensus_transform(
             int(round(sum(item.translation[0] for item in best_bucket) / len(best_bucket))),
             int(round(sum(item.translation[1] for item in best_bucket) / len(best_bucket))),
         ),
-        rotation=sum(item.rotation for item in best_bucket) / len(best_bucket),
+        rotation=_circular_mean([item.rotation for item in best_bucket]),
     )

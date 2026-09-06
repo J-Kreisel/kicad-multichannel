@@ -9,7 +9,8 @@ from kipy.proto.common.types import KIID, KiCadObjectType
 from multichannel_layout.domain.models import UpdatePlan
 from multichannel_layout.kicad.copy_executor import KiCadBoardExecutor
 from multichannel_layout.membership.executor import MembershipExecutor
-from multichannel_layout.membership.models import MembershipPlan
+from multichannel_layout.kicad.membership_reader import read_membership_board
+from multichannel_layout.membership.models import MembershipPlan, board_fingerprint
 
 
 def group(group_id, name, members):
@@ -98,6 +99,9 @@ class FakeBoard:
     def get_nets(self):
         return self.nets
 
+    def get_enabled_layers(self):
+        return [3, 34]
+
     def begin_commit(self):
         return object()
 
@@ -163,6 +167,15 @@ def update_plan():
     )
 
 
+def membership_plan(board, group_name, **changes):
+    snapshot = read_membership_board(board)
+    return MembershipPlan(
+        group_name,
+        board_fingerprint=board_fingerprint(snapshot),
+        **changes,
+    )
+
+
 class ExecutorTests(unittest.TestCase):
     def test_apply_resolves_plan_and_reconciles_active_group(self):
         board = FakeBoard()
@@ -199,9 +212,10 @@ class ExecutorTests(unittest.TestCase):
 
     def test_membership_executor_skips_items_in_foreign_groups(self):
         board = FakeBoard()
-        plan = MembershipPlan("CH2", add_item_ids=("source-track",))
+        plan = membership_plan(board, "CH2", add_item_ids=("source-track",))
 
-        result = MembershipExecutor(board).apply(plan)
+        with self.assertRaisesRegex(RuntimeError, "another group"):
+            MembershipExecutor(board).apply(plan)
 
         memberships = {
             board_group.id.value: {member.value for member in board_group.proto.items}
@@ -209,14 +223,13 @@ class ExecutorTests(unittest.TestCase):
         }
         self.assertIn("source-track", memberships["source-group"])
         self.assertNotIn("source-track", memberships["target-group"])
-        self.assertEqual(result.added_count, 0)
 
     def test_membership_executor_adds_ungrouped_item(self):
         board = FakeBoard()
         loose_track = BoardTrack()
         loose_track.proto.id.value = "loose-track"
         board.tracks.append(loose_track)
-        plan = MembershipPlan("CH2", add_item_ids=("loose-track",))
+        plan = membership_plan(board, "CH2", add_item_ids=("loose-track",))
 
         result = MembershipExecutor(board).apply(plan)
 
@@ -229,7 +242,7 @@ class ExecutorTests(unittest.TestCase):
 
     def test_membership_executor_removes_item_from_target_group(self):
         board = FakeBoard()
-        plan = MembershipPlan("CH2", remove_item_ids=("old-track",))
+        plan = membership_plan(board, "CH2", remove_item_ids=("old-track",))
 
         result = MembershipExecutor(board).apply(plan)
 
@@ -239,6 +252,34 @@ class ExecutorTests(unittest.TestCase):
         }
         self.assertNotIn("old-track", memberships["target-group"])
         self.assertEqual(result.removed_count, 1)
+
+    def test_membership_executor_rejects_item_locked_after_planning(self):
+        board = FakeBoard()
+        loose_track = BoardTrack()
+        loose_track.proto.id.value = "loose-track"
+        loose_track.locked = True
+        board.tracks.append(loose_track)
+        plan = membership_plan(board, "CH2", add_item_ids=("loose-track",))
+
+        with self.assertRaisesRegex(RuntimeError, "now locked"):
+            MembershipExecutor(board).apply(plan)
+
+        self.assertEqual(board.commit_count, 0)
+
+    def test_membership_executor_rejects_geometry_changed_after_planning(self):
+        board = FakeBoard()
+        loose_track = BoardTrack()
+        loose_track.proto.id.value = "loose-track"
+        loose_track.start = Vector2.from_xy(0, 0)
+        loose_track.end = Vector2.from_xy(1_000_000, 0)
+        board.tracks.append(loose_track)
+        plan = membership_plan(board, "CH2", add_item_ids=("loose-track",))
+        loose_track.end = Vector2.from_xy(2_000_000, 0)
+
+        with self.assertRaisesRegex(RuntimeError, "board changed"):
+            MembershipExecutor(board).apply(plan)
+
+        self.assertEqual(board.commit_count, 0)
 
 
 if __name__ == "__main__":

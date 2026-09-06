@@ -180,6 +180,38 @@ class PlannerTests(unittest.TestCase):
 
         self.assertEqual(origins, ((0, 0, 0), (100_000_000, 0, 0)))
 
+    def test_locked_anchors_treat_positive_and_negative_180_as_equal(self):
+        source = Channel(
+            "CH1",
+            "source-group",
+            footprints=[
+                footprint("R1", "s1", (0, 0), 0, "s1"),
+                footprint("U1", "s2", (10_000_000, 0), 0, "s2", pad_count=2),
+            ],
+        )
+        target = Channel(
+            "CH2",
+            "target-group",
+            footprints=[
+                footprint("R2", "t1", (100_000_000, 0), 180, "t1", locked=True),
+                footprint(
+                    "U2",
+                    "t2",
+                    (90_000_000, 0),
+                    -180,
+                    "t2",
+                    locked=True,
+                    pad_count=2,
+                ),
+            ],
+        )
+
+        origins = UpdatePlanner([source, target], 500_000).find_channel_origins(
+            "CH1", "CH2"
+        )
+
+        self.assertEqual(origins, ((0, 0, 0), (100_000_000, 0, 180)))
+
     def test_unmatched_locked_target_footprint_is_rejected(self):
         source = Channel(
             "CH1",

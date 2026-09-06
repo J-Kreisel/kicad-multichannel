@@ -2,50 +2,105 @@
 
 from __future__ import annotations
 
-from kipy.proto.board.board_types_pb2 import Pad as ProtoPad
-from kipy.proto.common.types import KiCadObjectType
+from collections import Counter
 
-from ..membership.models import CopperItem, MembershipBoard, MembershipPad
+from kipy.board_types import Pad, PadType
+from kipy.proto.common.types import KiCadObjectType
+from kipy.util.board_layer import is_copper_layer
+
+from ..membership.models import (
+    CopperItem,
+    MembershipBoard,
+    MembershipPad,
+    PolygonRegion,
+)
 from .groups import item_id, read_group_topology
 
 
-def _point(proto_point) -> tuple[int, int]:
-    return int(proto_point.x_nm), int(proto_point.y_nm)
+def _polyline_points(polyline) -> tuple[tuple[int, int], ...]:
+    points: list[tuple[int, int]] = []
+    for node in polyline.nodes:
+        if node.has_point:
+            points.append((node.point.x, node.point.y))
+        elif node.has_arc:
+            points.extend(
+                (
+                    (node.arc.start.x, node.arc.start.y),
+                    (node.arc.mid.x, node.arc.mid.y),
+                    (node.arc.end.x, node.arc.end.y),
+                )
+            )
+    return tuple(points)
 
 
-def _copper_layers(pad_stack) -> frozenset[int]:
-    layers = {int(layer.layer) for layer in pad_stack.copper_layers}
-    if not layers:
-        layers.update(int(layer) for layer in pad_stack.layers)
-    start_layer = int(pad_stack.drill.start_layer)
-    end_layer = int(pad_stack.drill.end_layer)
-    if 3 <= start_layer <= 34 and 3 <= end_layer <= 34:
-        lower, upper = sorted((start_layer, end_layer))
-        layers.update(range(lower, upper + 1))
-    return frozenset(layers)
+def _item_regions(board, item, copper_layers: list[int]) -> tuple[PolygonRegion, ...]:
+    regions: list[PolygonRegion] = []
+    for layer in copper_layers:
+        polygons = board.get_pad_shapes_as_polygons([item], layer)
+        if not polygons:
+            continue
+        polygon = polygons[0]
+        outline = _polyline_points(polygon.outline)
+        if len(outline) < 3:
+            continue
+        regions.append(
+            PolygonRegion(
+                layer=int(layer),
+                outline=outline,
+                holes=tuple(_polyline_points(hole) for hole in polygon.holes),
+            )
+        )
+    return tuple(regions)
+
+
+def _require_unique_ids(items, item_type: str) -> None:
+    ids = [item.item_id for item in items]
+    if any(not item_id for item_id in ids):
+        raise RuntimeError(f"{item_type} has an empty ID")
+    duplicates = {
+        item_id for item_id, count in Counter(ids).items() if count > 1
+    }
+    if duplicates:
+        raise RuntimeError(f"duplicate {item_type} IDs: {sorted(duplicates)}")
 
 
 def read_membership_board(board) -> MembershipBoard:
     topology, _ = read_group_topology(board)
     pads: list[MembershipPad] = []
-    footprints = board.get_items(types=[KiCadObjectType.KOT_PCB_FOOTPRINT])
+    copper_layers = [
+        int(layer) for layer in board.get_enabled_layers() if is_copper_layer(layer)
+    ]
+    footprints = board.get_footprints()
     for footprint in footprints:
         footprint_id = item_id(footprint.id)
-        for packed_item in footprint.proto.definition.items:
-            if not packed_item.type_url.endswith("kiapi.board.types.Pad"):
+        for pad in footprint.definition.items:
+            if not isinstance(pad, Pad):
                 continue
-            pad = ProtoPad()
-            packed_item.Unpack(pad)
             pad_id = item_id(pad.id) or f"{footprint_id}:{pad.number}"
-            pads.append(
-                MembershipPad(
-                    item_id=pad_id,
-                    footprint_id=footprint_id,
-                    net=str(pad.net.name),
-                    position=_point(pad.position),
-                    layers=_copper_layers(pad.pad_stack),
+            regions = _item_regions(board, pad, copper_layers)
+            if pad.pad_type == PadType.PT_NPTH:
+                for region in regions:
+                    pads.append(
+                        MembershipPad(
+                            item_id=f"{pad_id}@{region.layer}",
+                            footprint_id=footprint_id,
+                            net=str(pad.net.name),
+                            position=(pad.position.x, pad.position.y),
+                            layers=frozenset((region.layer,)),
+                            regions=(region,),
+                        )
+                    )
+            elif regions:
+                pads.append(
+                    MembershipPad(
+                        item_id=pad_id,
+                        footprint_id=footprint_id,
+                        net=str(pad.net.name),
+                        position=(pad.position.x, pad.position.y),
+                        layers=frozenset(region.layer for region in regions),
+                        regions=regions,
+                    )
                 )
-            )
 
     copper: list[CopperItem] = []
     for track in board.get_items(types=[KiCadObjectType.KOT_PCB_TRACE]):
@@ -57,6 +112,7 @@ def read_membership_board(board) -> MembershipBoard:
                 points=((track.start.x, track.start.y), (track.end.x, track.end.y)),
                 layers=frozenset((int(track.layer),)),
                 locked=bool(track.locked),
+                width=int(track.width),
             )
         )
     for arc in board.get_items(types=[KiCadObjectType.KOT_PCB_ARC]):
@@ -68,17 +124,23 @@ def read_membership_board(board) -> MembershipBoard:
                 points=((arc.start.x, arc.start.y), (arc.end.x, arc.end.y)),
                 layers=frozenset((int(arc.layer),)),
                 locked=bool(arc.locked),
+                width=int(arc.width),
+                mid=(arc.mid.x, arc.mid.y),
             )
         )
     for via in board.get_items(types=[KiCadObjectType.KOT_PCB_VIA]):
+        regions = _item_regions(board, via, copper_layers)
         copper.append(
             CopperItem(
                 item_id=item_id(via.id),
                 net=via.net.name,
                 kind="via",
                 points=((via.position.x, via.position.y),),
-                layers=_copper_layers(via.proto.pad_stack),
+                layers=frozenset(region.layer for region in regions),
                 locked=bool(via.locked),
+                regions=regions,
             )
         )
+    _require_unique_ids(pads, "pad node")
+    _require_unique_ids(copper, "copper item")
     return MembershipBoard(topology.groups, tuple(pads), tuple(copper))
