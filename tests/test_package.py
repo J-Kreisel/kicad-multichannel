@@ -8,7 +8,7 @@ from tools.build_pcm_repository import build_repository
 
 
 def test_pcm_archive_and_feed(tmp_path):
-    archive = build(tmp_path / "kicad-multichannel-0.1.0-kicad-pcm.zip")
+    archive = build(tmp_path / "kicad-multichannel-test-kicad-pcm.zip")
     with zipfile.ZipFile(archive) as package:
         names = package.namelist()
         assert "plugins/plugin.json" in names

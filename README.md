@@ -2,7 +2,7 @@
 
 Native KiCad IPC plugin with a preview-first GUI for repeated PCB channels.
 
-> **0.1.0 is a testing release.** Save a backup, inspect every result, and run DRC.
+> **0.1.1 is a testing release.** Save a backup, inspect every result, and run DRC.
 > The package targets KiCad 10+, Python 3.11+, and Linux, Windows, and macOS.
 > Copy/apply was smoke-tested on KiCad 10.0.6 on Linux; PCM installation,
 > undo, and Windows/macOS runtime still need manual validation.

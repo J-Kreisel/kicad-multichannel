@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kicad-multichannel-layout"
-version = "0.1.0"
+version = "0.1.1"
 description = "Copy KiCad channel placement and routing, and repair routing group membership"
 readme = "README.md"
 requires-python = ">=3.11"

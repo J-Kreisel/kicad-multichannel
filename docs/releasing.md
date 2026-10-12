@@ -17,8 +17,8 @@ Plugin and Content Manager feed. This is not an official KiCad PCM listing.
 
 ```sh
 git push origin main
-git tag v0.1.0   # must equal pyproject.toml version
-git push origin v0.1.0
+git tag -a v0.1.1 -m 'KiCad Multichannel Layout 0.1.1'  # must equal pyproject.toml version
+git push origin v0.1.1
 ```
 
 The release workflow runs tests, builds the PCM ZIP, creates a GitHub prerelease,
@@ -40,7 +40,8 @@ python tools/build_pcm_repository.py --output dist/repository
 - Service tests for stale previews, duplicate groups, and partial failures.
 - Offscreen GUI tests using a mocked KiCad connection.
 - Archive/feed content and checksum tests.
-- Local tests use KiPy 0.8.0 and Python 3.13 on Linux/NixOS.
+- Local tests use KiPy 0.8.0 and Python 3.11/3.13 on Linux/NixOS.
+- GitHub CI passes the same suite on Linux, Windows, and macOS (Python 3.11).
 - Live KiCad 10.0.6 smoke test on a disposable copy of the previous test PCB:
   two targets each received 26 footprints, 66 tracks, and one via; stale re-apply
   was rejected; add/remove membership analysis and no-op apply succeeded.
