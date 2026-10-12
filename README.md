@@ -21,6 +21,9 @@ Refresh the repository and install **KiCad Multichannel Layout**. Restart PCB Ed
 KiCad installs KiPy and PySide6 into its isolated plugin Python environment;
 dependency installation needs internet access on first load.
 
+On minimal Linux installations, Qt also needs host OpenGL/EGL and X11 libraries.
+For Debian/Ubuntu: `sudo apt install libegl1 libgl1 libxkbcommon0 libxcb-cursor0`.
+
 ### Install from a release ZIP
 
 Download `kicad-multichannel-<version>-kicad-pcm.zip` from
@@ -225,6 +228,8 @@ The package is split into three layers:
 
 - `multichannel_layout.py` — minimal executable entry point.
 - `multichannel_layout/cli.py` — subcommand parsing and reporting.
+- `multichannel_layout/gui.py` — PySide6 preview/apply interface.
+- `multichannel_layout/service.py` — shared orchestration and stale-preview checks.
 - `multichannel_layout/domain/` — KiCad-independent logic: board snapshots,
   matching, origins/bucketing, geometry, and update planning.
 - `multichannel_layout/kicad/` — IPC adapters: reading boards, group topology
@@ -234,6 +239,8 @@ The package is split into three layers:
 - `tests/` — unit tests for geometry, planning, group invariants, and
   membership analysis.
 - `flake.nix` / `.envrc` — dev shell with `kicad-python`.
+- `kicad_plugin/` — native IPC manifest, launcher, icons, and PCM metadata.
+- `tools/` / `.github/workflows/` — package/feed generation, tests, and releases.
 
 ## License
 
