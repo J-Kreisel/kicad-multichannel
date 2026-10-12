@@ -1,0 +1,21 @@
+name: Test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m pytest
+      - run: python -m ruff check multichannel_layout/gui.py multichannel_layout/service.py multichannel_layout/cli.py tools tests/test_gui.py tests/test_service.py tests/test_package.py
+      - run: python tools/build_kicad_plugin.py

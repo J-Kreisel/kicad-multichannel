@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kicad-multichannel-layout"
+version = "0.1.0"
+description = "Copy KiCad channel placement and routing, and repair routing group membership"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "Johannes"}]
+dependencies = ["kicad-python>=0.7.0"]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.6,<7"]
+dev = ["pytest>=8", "ruff>=0.9", "PySide6>=6.6,<7"]
+
+[project.scripts]
+kicad-multichannel = "multichannel_layout.cli:main"
+kicad-multichannel-gui = "multichannel_layout.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["multichannel_layout*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

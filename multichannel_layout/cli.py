@@ -10,13 +10,9 @@ from kipy import KiCad
 from kipy.errors import ConnectionError as KipyConnectionError
 
 from .domain.models import Channel, UpdatePlan
-from .domain.planner import UpdatePlanner
-from .kicad.copy_executor import KiCadBoardExecutor
-from .kicad.membership_reader import read_membership_board
 from .kicad.reader import read_board_snapshot, read_channel_summaries
-from .membership.executor import MembershipExecutor
 from .membership.models import MembershipPlan
-from .membership.planner import build_membership_plan
+from . import service
 
 
 def _find_channel(channels: list[Channel], name: str) -> Channel | None:
@@ -131,86 +127,35 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def _run_copy(args, board, channels: list[Channel]) -> int:
-    ignored = {
-        reference.strip()
-        for reference in args.ignore.split(",")
-        if reference.strip()
-    }
-    if ignored:
-        print(f"Ignoring footprints: {sorted(ignored)}")
-        for channel in channels:
-            original_count = len(channel.footprints)
-            channel.footprints = [
-                footprint
-                for footprint in channel.footprints
-                if footprint.reference not in ignored
-            ]
-            removed_count = original_count - len(channel.footprints)
-            if removed_count:
-                print(f"  {channel.name}: removed {removed_count} footprint(s)")
-
-    source = _find_channel(channels, args.channels[0])
-    if source is None:
-        print(f"Source channel {args.channels[0]!r} not found.", file=sys.stderr)
-        return 5
-    targets: list[Channel] = []
-    for name in args.channels[1:]:
-        target = _find_channel(channels, name)
-        if target is None:
-            print(f"Target channel {name!r} not found.", file=sys.stderr)
-            return 6
-        if target is source:
-            print(f"Source and target {name!r} must be different.", file=sys.stderr)
-            return 7
-        targets.append(target)
-
-    plans: list[UpdatePlan] = []
-    planner = UpdatePlanner(channels, args.bucket_size)
-    for target in targets:
-        try:
-            plan = planner.build_update_plan(source.name, target.name)
-        except ValueError as exc:
-            print(f"Cannot plan {source.name} -> {target.name}: {exc}", file=sys.stderr)
-            return 8
-        if plan is None:
-            print(f"\n{source.name} -> {target.name}\n  no matched footprints")
-            continue
-        plans.append(plan)
-        _print_copy_plan(plan, args.verbose)
-
-    if args.dry_run:
-        count = sum(len(plan.footprint_matches) for plan in plans)
-        print(f"\nTotal footprints dry-run: {count}")
-        return 0
-
-    executor = KiCadBoardExecutor(board)
-    updated_count = 0
-    for plan in plans:
-        try:
-            result = executor.apply(plan)
-        except Exception as exc:
-            print(
-                f"Error applying {plan.source_channel} -> {plan.target_channel}: {exc}",
-                file=sys.stderr,
-            )
-            return 8
-        updated_count += result.footprint_count
-        print(
-            f"  {result.target_channel}: updated {result.footprint_count} footprints, "
-            f"created {result.track_count} tracks/{result.via_count} vias"
+    names = []
+    for name in args.channels:
+        channel = _find_channel(channels, name)
+        if channel is None:
+            print(f"Channel {name!r} not found or ambiguous.", file=sys.stderr)
+            return 5
+        names.append(channel.name)
+    try:
+        preview = service.preview_copy(
+            board, names[0], names[1:], args.bucket_size,
+            {ref.strip() for ref in args.ignore.split(",") if ref.strip()},
         )
-        if result.locked_footprint_count or result.locked_net_count:
-            print(
-                f"    skipped locked: {result.locked_footprint_count} footprints, "
-                f"{result.locked_net_count} routed nets"
-            )
-    print(f"\nTotal footprints applied: {updated_count}")
+        for plan in preview.copy_plans:
+            _print_copy_plan(plan, args.verbose)
+        for note in preview.notes:
+            print(note)
+        if not args.dry_run:
+            for result in service.apply_preview(board, preview):
+                print(result)
+    except Exception as error:
+        print(f"Copy failed: {error}", file=sys.stderr)
+        return 8
     return 0
 
 
 def _run_membership(args, board, mode: str) -> int:
     try:
-        plan = build_membership_plan(read_membership_board(board), args.group, mode)
+        preview = service.preview_membership(board, args.group, mode)
+        plan = preview.membership_plan
     except Exception as exc:
         print(f"Cannot plan membership update: {exc}", file=sys.stderr)
         return 9
@@ -218,7 +163,7 @@ def _run_membership(args, board, mode: str) -> int:
     if args.dry_run:
         return 0
     try:
-        result = MembershipExecutor(board).apply(plan)
+        result = service.apply_preview(board, preview)[0]
     except Exception as exc:
         print(f"Error applying membership update: {exc}", file=sys.stderr)
         return 9

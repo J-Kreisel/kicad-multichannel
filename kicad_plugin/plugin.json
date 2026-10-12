@@ -1,0 +1,17 @@
+{
+  "$schema": "https://go.kicad.org/api/schemas/v1",
+  "identifier": "com.github.j-kreisel.kicad-multichannel",
+  "name": "KiCad Multichannel Layout",
+  "description": "Copy channel layout and repair routing group membership.",
+  "runtime": {"type": "python", "min_version": "3.11"},
+  "actions": [{
+    "identifier": "open-multichannel-layout",
+    "name": "Multichannel Layout",
+    "description": "Preview and copy placement and routing between channel groups.",
+    "show-button": true,
+    "scopes": ["pcb"],
+    "entrypoint": "launch.py",
+    "icons-light": ["icons/multichannel-light-24.png", "icons/multichannel-light-48.png"],
+    "icons-dark": ["icons/multichannel-dark-24.png", "icons/multichannel-dark-48.png"]
+  }]
+}

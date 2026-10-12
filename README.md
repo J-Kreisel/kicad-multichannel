@@ -1,5 +1,76 @@
 # KiCad Multichannel Layout
 
+Native KiCad IPC plugin with a preview-first GUI for repeated PCB channels.
+
+> **0.1.0 is a testing release.** Save a backup, inspect every result, and run DRC.
+> The package targets KiCad 10+, Python 3.11+, and Linux, Windows, and macOS.
+> Copy/apply was smoke-tested on KiCad 10.0.6 on Linux; PCM installation,
+> undo, and Windows/macOS runtime still need manual validation.
+
+## Install
+
+### Subscribe in Plugin and Content Manager
+
+In KiCad's project manager, open **Plugin and Content Manager → Manage… → Add repository**:
+
+```text
+https://raw.githubusercontent.com/J-Kreisel/kicad-multichannel/pcm/repository.json
+```
+
+Refresh the repository and install **KiCad Multichannel Layout**. Restart PCB Editor.
+KiCad installs KiPy and PySide6 into its isolated plugin Python environment;
+dependency installation needs internet access on first load.
+
+### Install from a release ZIP
+
+Download `kicad-multichannel-<version>-kicad-pcm.zip` from
+[GitHub Releases](https://github.com/J-Kreisel/kicad-multichannel/releases).
+Choose **Plugin and Content Manager → Install from File…** and select the ZIP without extracting it.
+
+## Graphical workflow
+
+1. Open your PCB and enable KiCad's IPC API server in preferences if necessary.
+2. Put each repeated channel's footprints in a uniquely named PCB group.
+   Include the source tracks/vias you want copied in the source group.
+   Footprints must be direct members of the channel group, not only nested groups.
+3. Open **Multichannel Layout** from the PCB toolbar or **Tools → External Plugins**.
+4. Select the source and check one or more different target channels.
+5. Click **Preview** and review footprint/net matches, origins, and skipped footprints.
+6. Click **Apply to KiCad** and confirm. Do not edit the board during preview/apply.
+7. Inspect the PCB, run DRC, and save only when satisfied.
+
+The **Repair membership** tab previews adding missing or removing unnecessary routing
+memberships. It changes group ownership only, never copper geometry.
+
+Changing settings invalidates the preview. Copy apply also verifies the serialized
+footprints, tracks, vias, groups, and board identity against the preview.
+Membership apply additionally checks its connectivity fingerprint.
+IPC reads and commits are not a board-wide transaction: keep the board unchanged
+while an operation runs. Targets are applied sequentially; earlier targets remain
+applied if a later target fails.
+
+![Multichannel GUI with illustrative preview data](docs/gui.png)
+
+The screenshot uses illustrative channel data, not a live-board validation result.
+
+## Development and packaging
+
+```sh
+python -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+pytest
+python tools/build_kicad_plugin.py
+```
+
+On NixOS, use `nix develop` for Qt's host shared libraries. The plugin launcher
+also adapts the autorouter's NixOS/X11 compatibility handling.
+`kicad-multichannel-gui` starts the GUI; a standalone run needs the IPC environment
+from KiCad. Normal installed-plugin launches receive it automatically.
+
+The build produces a pure-Python PCM archive in `dist/`; no Rust compiler or Nix
+is needed on users' machines. See [release instructions](docs/releasing.md).
+
 Multichannel placement and routing copier plus routing membership repair tools.
 `copy` matches footprints pairwise, copies their relative placement, and
 replaces safely matched target routing. `add-membership` / `remove-membership`
@@ -166,4 +237,4 @@ The package is split into three layers:
 
 ## License
 
-TBD.
+MIT — see [LICENSE](LICENSE).
