@@ -1,0 +1,17 @@
+{
+  "$schema": "https://go.kicad.org/pcm/schemas/v2",
+  "schema_version": 2,
+  "name": "KiCad Multichannel Layout",
+  "maintainer": {
+    "name": "Johannes",
+    "contact": {
+      "web": "https://github.com/J-Kreisel"
+    }
+  },
+  "packages": {
+    "url": "https://raw.githubusercontent.com/J-Kreisel/kicad-multichannel/pcm/packages.json",
+    "sha256": "59db162a118707e5e16b0dd9451af6fd570a0280db55d2e32d601502527f015b",
+    "update_timestamp": 1791814781,
+    "update_time_utc": "2026-10-12 14:19:41"
+  }
+}
