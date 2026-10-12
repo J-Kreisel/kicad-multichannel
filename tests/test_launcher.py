@@ -12,4 +12,4 @@ def test_nixos_library_discovery_does_not_override_interpreter_runtime(monkeypat
     ])
     monkeypatch.setattr(Path, "read_text", lambda self: maps)
     monkeypatch.setattr(Path, "glob", lambda *args: [])
-    assert _kicad_library_paths() == ["/nix/store/hash-libglvnd-1.7/lib"]
+    assert _kicad_library_paths() == [str(Path("/nix/store/hash-libglvnd-1.7/lib"))]
