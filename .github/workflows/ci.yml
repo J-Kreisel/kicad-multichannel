@@ -16,6 +16,9 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install -e '.[dev]'
-      - run: python -m pytest
+      - run: python -m pytest --junitxml=test-results.xml
+      - name: Report test diagnostics
+        if: failure()
+        run: python -c "from pathlib import Path; p=Path('test-results.xml'); print('::error::' + (p.read_text() if p.exists() else 'No test report produced').replace('%', '%25').replace('\n', '%0A').replace('\r', '%0D'))"
       - run: python -m ruff check multichannel_layout/gui.py multichannel_layout/service.py multichannel_layout/cli.py tools tests/test_gui.py tests/test_service.py tests/test_package.py
       - run: python tools/build_kicad_plugin.py

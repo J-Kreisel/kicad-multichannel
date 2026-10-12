@@ -16,7 +16,10 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install -e '.[dev]'
-      - run: python -m pytest
+      - run: python -m pytest --junitxml=test-results.xml
+      - name: Report test diagnostics
+        if: failure()
+        run: python -c "from pathlib import Path; p=Path('test-results.xml'); print('::error::' + (p.read_text() if p.exists() else 'No test report produced').replace('%', '%25').replace('\n', '%0A').replace('\r', '%0D'))"
       - name: Check tag matches package version
         if: startsWith(github.ref, 'refs/tags/v')
         run: python -c 'import os,tomllib; assert os.environ["GITHUB_REF_NAME"] == "v" + tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]'
